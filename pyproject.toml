@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mega-up"
+version = "0.2.0"
+description = "Fused SM100 GEMM and Ulysses all-to-all kernels"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT AND Apache-2.0"
+license-files = [
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_LICENSES.md",
+    "licenses/*",
+]
+authors = [{ name = "The Mega-UP Authors" }]
+keywords = [
+    "pytorch",
+    "cutlass",
+    "gemm",
+    "sequence-parallel",
+    "ulysses",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.7",
+    "nvidia-cutlass-dsl>=4.4.2,<4.5",
+    "cuda-python>=12.9,<14",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+build = ["build>=1"]
+
+[tool.setuptools.packages.find]
+include = ["mega_up*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["sm100: requires SM100/SM110 and torchrun"]

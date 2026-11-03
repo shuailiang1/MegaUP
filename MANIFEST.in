@@ -1,0 +1,7 @@
+include LICENSE
+include NOTICE
+include README.md
+include THIRD_PARTY_LICENSES.md
+recursive-include licenses *
+recursive-include benchmarks *.py
+recursive-include tests *.py
