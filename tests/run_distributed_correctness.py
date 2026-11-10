@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Direct SM100 correctness runner; invoke with ``torchrun``."""
+"""Distributed correctness runner; invoke with ``torchrun``."""
 
 from __future__ import annotations
 
@@ -37,8 +37,39 @@ DEFAULT_THD_CASES = ((33, 31), (17, 1, 16))
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--up", type=int, required=True)
-    parser.add_argument("--heads", type=int, default=16)
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=16,
+        help="peer-write input heads; the peer-write weight is [N, heads*D]",
+    )
+    parser.add_argument(
+        "--peer-out-heads",
+        type=int,
+        default=0,
+        help="peer-write output heads, split across ranks (default: --heads)",
+    )
+    parser.add_argument(
+        "--pull-in-heads",
+        type=int,
+        default=0,
+        help="pull input heads, split across ranks (default: --peer-out-heads)",
+    )
+    parser.add_argument(
+        "--pull-out-heads",
+        type=int,
+        default=0,
+        help="pull output heads (default: --heads)",
+    )
     parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument(
+        "--runtime-per-width",
+        action="store_true",
+        help=(
+            "give the peer-write and the pull exchanged width a runtime each "
+            "on the process group instead of sharing one sized for the wider"
+        ),
+    )
     parser.add_argument(
         "--bias",
         action="store_true",
@@ -155,7 +186,7 @@ def baseline_peer_write_thd(
     """``linear + all_to_all_single``; ``cu_seqlens=None`` keeps source order."""
 
     tokens, heads, head_dim = map(int, x.shape)
-    shard_heads = heads // up
+    shard_heads = int(weight.shape[0]) // (up * head_dim)
     dense = F.linear(x.view(tokens, heads * head_dim), weight, bias)
     send = (
         dense.view(tokens, up, shard_heads * head_dim)
@@ -198,7 +229,7 @@ def baseline_pull_gemm_thd(
         .reshape(tokens, heads * head_dim)
         .contiguous()
     )
-    output = F.linear(materialized, weight, bias).view(tokens, heads, head_dim)
+    output = F.linear(materialized, weight, bias).view(tokens, -1, head_dim)
     return materialized, output
 
 
@@ -211,12 +242,8 @@ def baseline_peer_write(
     group: dist.ProcessGroup,
 ) -> torch.Tensor:
     batch, sequence, heads, head_dim = map(int, x.shape)
-    shard_heads = heads // up
-    dense = F.linear(
-        x.view(batch, sequence, heads * head_dim),
-        weight,
-        bias,
-    ).view(batch, sequence, heads, head_dim)
+    shard_heads = int(weight.shape[0]) // (up * head_dim)
+    dense = F.linear(x.view(batch, sequence, heads * head_dim), weight, bias)
     send = (
         dense.view(batch, sequence, up, shard_heads, head_dim)
         .permute(2, 0, 1, 3, 4)
@@ -242,7 +269,7 @@ def baseline_peer_write_sbhd(
     """``linear`` + all-to-all along the sequence dimension of ``[S,B,H,D]``."""
 
     sequence, batch, heads, head_dim = map(int, x.shape)
-    shard_heads = heads // up
+    shard_heads = int(weight.shape[0]) // (up * head_dim)
     dense = F.linear(x.view(sequence, batch, heads * head_dim), weight, bias)
     send = (
         dense.view(sequence, batch, up, shard_heads, head_dim)
@@ -262,7 +289,7 @@ def baseline_pull_gemm_sbhd(
     up: int,
     group: dist.ProcessGroup,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """All-to-all of ``[UP*S,B,H/UP,D]`` back to ``[S,B,H*D]``, then ``linear``."""
+    """All-to-all of ``[UP*S,B,H/UP,D]`` to ``[S,B,H*D]``, then ``linear``."""
 
     global_sequence, batch, shard_heads, head_dim = map(int, head_x.shape)
     sequence = global_sequence // up
@@ -274,9 +301,7 @@ def baseline_pull_gemm_sbhd(
         .reshape(sequence, batch, up * shard_heads * head_dim)
         .contiguous()
     )
-    output = F.linear(materialized, weight, bias).view(
-        sequence, batch, up * shard_heads, head_dim
-    )
+    output = F.linear(materialized, weight, bias).view(sequence, batch, -1, head_dim)
     return materialized, output
 
 
@@ -307,7 +332,7 @@ def baseline_pull_gemm(
         materialized.view(batch, sequence, heads * head_dim),
         weight,
         bias,
-    ).view(batch, sequence, heads, head_dim)
+    ).view(batch, sequence, -1, head_dim)
     return materialized, output
 
 
@@ -377,11 +402,17 @@ def check_prepared_peer_write(
     )
 
 
-def expect_collective_rejection(call, *, name: str, device: torch.device) -> None:
+def expect_collective_rejection(
+    call,
+    *,
+    name: str,
+    device: torch.device,
+    error_type: type[Exception] = ValueError,
+) -> None:
     rejected = torch.zeros((), dtype=torch.int32, device=device)
     try:
         call()
-    except ValueError:
+    except error_type:
         rejected.fill_(1)
     dist.all_reduce(rejected, op=dist.ReduceOp.MIN)
     if not bool(rejected.item()):
@@ -401,8 +432,11 @@ def main() -> None:
         raise ValueError(
             f"--up must be one of {SUPPORTED_UP_DEGREES}, got {args.up}"
         )
-    if args.heads % args.up:
-        raise ValueError("heads must be divisible by UP")
+    peer_out_heads = args.peer_out_heads or args.heads
+    pull_in_heads = args.pull_in_heads or peer_out_heads
+    pull_out_heads = args.pull_out_heads or args.heads
+    if peer_out_heads % args.up or pull_in_heads % args.up:
+        raise ValueError("the exchanged head counts must be divisible by UP")
     if int(os.environ["WORLD_SIZE"]) != args.up:
         raise ValueError("WORLD_SIZE must equal --up for this runner")
 
@@ -412,13 +446,17 @@ def main() -> None:
     device = torch.device("cuda", local_rank)
     capability = torch.cuda.get_device_capability(device)
     if capability[0] not in (10, 11):
-        raise RuntimeError(f"SM100/SM110 required, got {capability}")
+        raise RuntimeError(f"unsupported GPU (compute capability {capability})")
     converter_module = importlib.import_module(
         "cutlass.cute._tvm_ffi_args_spec_converter"
     )
     converter_before = converter_module._convert_single_arg
 
-    hidden = args.heads * args.head_dim
+    head_dim = args.head_dim
+    # The exchanged widths: the peer-write output and the pull input.
+    peer_width = peer_out_heads * head_dim
+    pull_width = pull_in_heads * head_dim
+    hidden = max(peer_width, pull_width)
     max_rows = max(
         [batch * sequence for batch, sequence in cases]
         + [sequence * batch for sequence, batch in sbhd_cases]
@@ -449,26 +487,59 @@ def main() -> None:
         name="rank-local runtime configuration mismatch",
         device=device,
     )
-    runtime = initialize_runtime(
-        dist.group.WORLD,
-        hidden=hidden,
-        max_rows=max_rows,
+
+    def runtime_for(width: int):
+        return initialize_runtime(
+            dist.group.WORLD, hidden=width, max_rows=max_rows, device=device
+        )
+
+    # By default one runtime, sized for the wider exchanged width, serves both
+    # projections. With --runtime-per-width each width gets its own runtime
+    # (and arena) on the same process group.
+    peer_runtime = runtime_for(peer_width if args.runtime_per_width else hidden)
+    pull_runtime = runtime_for(pull_width if args.runtime_per_width else hidden)
+    if (peer_runtime is pull_runtime) != (peer_runtime.hidden == pull_runtime.hidden):
+        raise AssertionError("a group must hold exactly one runtime per hidden")
+    if peer_runtime is not pull_runtime and (
+        peer_runtime.arena.data_ptr() == pull_runtime.arena.data_ptr()
+    ):
+        raise AssertionError("runtimes of different hidden must not share an arena")
+    for existing in (peer_runtime, pull_runtime):
+        if runtime_for(existing.hidden) is not existing:
+            raise AssertionError("an existing runtime must be returned for its hidden")
+    expect_collective_rejection(
+        lambda: initialize_runtime(
+            dist.group.WORLD,
+            hidden=peer_runtime.hidden,
+            max_rows=max_rows + 1,
+            device=device,
+        ),
+        name="changed capacity of an existing runtime",
         device=device,
+        error_type=RuntimeError,
     )
 
     torch.manual_seed(1234)
     peer_weight = torch.randn(
-        (hidden, hidden),
+        (peer_out_heads * head_dim, args.heads * head_dim),
         dtype=torch.bfloat16,
         device=device,
     )
     torch.manual_seed(5678)
-    pull_weight = torch.randn_like(peer_weight)
+    pull_weight = torch.randn(
+        (pull_out_heads * head_dim, pull_in_heads * head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
     peer_bias = pull_bias = None
     if args.bias:
         torch.manual_seed(9012)
-        peer_bias = torch.randn(hidden, dtype=torch.bfloat16, device=device)
-        pull_bias = torch.randn_like(peer_bias)
+        peer_bias = torch.randn(
+            peer_out_heads * head_dim, dtype=torch.bfloat16, device=device
+        )
+        pull_bias = torch.randn(
+            pull_out_heads * head_dim, dtype=torch.bfloat16, device=device
+        )
     results: list[dict[str, object]] = []
 
     for case_index, (batch, sequence) in enumerate(cases):
@@ -478,7 +549,9 @@ def main() -> None:
             dtype=torch.bfloat16,
             device=device,
         )
-        actual_peer = peer_write_gemm_bshd(x, peer_weight, runtime, bias=peer_bias)
+        actual_peer = peer_write_gemm_bshd(
+            x, peer_weight, peer_runtime, bias=peer_bias
+        )
         converter_restored = torch.tensor(
             int(converter_module._convert_single_arg is converter_before),
             dtype=torch.int32,
@@ -506,7 +579,7 @@ def main() -> None:
         prepared_peer_metrics = check_prepared_peer_write(
             prepare_peer_write_gemm_bshd(
                 peer_weight,
-                runtime,
+                peer_runtime,
                 batch=batch,
                 sequence=sequence,
                 heads=args.heads,
@@ -526,19 +599,19 @@ def main() -> None:
             (
                 batch,
                 args.up * sequence,
-                args.heads // args.up,
-                args.head_dim,
+                pull_in_heads // args.up,
+                head_dim,
             ),
             dtype=torch.bfloat16,
             device=device,
         )
         prepared_pull = prepare_headshard_pull_gemm_bshd(
             pull_weight,
-            runtime,
+            pull_runtime,
             batch=batch,
             sequence=sequence,
-            heads=args.heads,
-            head_dim=args.head_dim,
+            heads=pull_in_heads,
+            head_dim=head_dim,
             bias=pull_bias,
             workspace_epochs=2,
         )
@@ -591,7 +664,9 @@ def main() -> None:
             dtype=torch.bfloat16,
             device=device,
         )
-        actual_peer = peer_write_gemm_sbhd(x, peer_weight, runtime, bias=peer_bias)
+        actual_peer = peer_write_gemm_sbhd(
+            x, peer_weight, peer_runtime, bias=peer_bias
+        )
         expected_peer = baseline_peer_write_sbhd(
             x,
             peer_weight,
@@ -609,7 +684,7 @@ def main() -> None:
         prepared_peer_metrics = check_prepared_peer_write(
             prepare_peer_write_gemm_sbhd(
                 peer_weight,
-                runtime,
+                peer_runtime,
                 sequence=sequence,
                 batch=batch,
                 heads=args.heads,
@@ -626,17 +701,17 @@ def main() -> None:
 
         torch.manual_seed(60_000 + 100 * case_index + dist.get_rank())
         head_x = torch.randn(
-            (args.up * sequence, batch, args.heads // args.up, args.head_dim),
+            (args.up * sequence, batch, pull_in_heads // args.up, head_dim),
             dtype=torch.bfloat16,
             device=device,
         )
         prepared_pull = prepare_headshard_pull_gemm_sbhd(
             pull_weight,
-            runtime,
+            pull_runtime,
             sequence=sequence,
             batch=batch,
-            heads=args.heads,
-            head_dim=args.head_dim,
+            heads=pull_in_heads,
+            head_dim=head_dim,
             bias=pull_bias,
             workspace_epochs=2,
         )
@@ -683,7 +758,7 @@ def main() -> None:
             torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
             if case_index % 2 == 0
             else cu_seqlens,
-            runtime,
+            peer_runtime,
         )
         if layout.cu_seqlens_out != tuple(args.up * value for value in cu_seqlens):
             raise AssertionError("THD output boundaries must be UP * cu_seqlens")
@@ -701,7 +776,7 @@ def main() -> None:
                 device=device,
             )
             actual_peer = peer_write_gemm_thd(
-                x, peer_weight, runtime, bias=peer_bias, layout=active_layout
+                x, peer_weight, peer_runtime, bias=peer_bias, layout=active_layout
             )
             expected_peer = baseline_peer_write_thd(
                 x,
@@ -721,7 +796,7 @@ def main() -> None:
             prepared_peer_metrics = check_prepared_peer_write(
                 prepare_peer_write_gemm_thd(
                     peer_weight,
-                    runtime,
+                    peer_runtime,
                     heads=args.heads,
                     head_dim=args.head_dim,
                     tokens=tokens if active_layout is None else None,
@@ -743,15 +818,15 @@ def main() -> None:
 
             torch.manual_seed(40_000 + 100 * case_index + dist.get_rank())
             head_x = torch.randn(
-                (args.up * tokens, args.heads // args.up, args.head_dim),
+                (args.up * tokens, pull_in_heads // args.up, head_dim),
                 dtype=torch.bfloat16,
                 device=device,
             )
             prepared_pull = prepare_headshard_pull_gemm_thd(
                 pull_weight,
-                runtime,
-                heads=args.heads,
-                head_dim=args.head_dim,
+                pull_runtime,
+                heads=pull_in_heads,
+                head_dim=head_dim,
                 tokens=tokens if active_layout is None else None,
                 layout=active_layout,
                 bias=pull_bias,
@@ -811,7 +886,7 @@ def main() -> None:
         local_lengths = rank0_lengths if dist.get_rank() == 0 else shared_lengths
         mismatched_layout = prepare_thd_layout(
             cu_seqlens_from_lengths(local_lengths),
-            runtime,
+            peer_runtime,
         )
         mismatched_x = torch.randn(
             (mismatched_layout.tokens, args.heads, args.head_dim),
@@ -822,7 +897,7 @@ def main() -> None:
             lambda: peer_write_gemm_thd(
                 mismatched_x,
                 peer_weight,
-                runtime,
+                peer_runtime,
                 layout=mismatched_layout,
             ),
             name="rank-local THD cu_seqlens mismatch",
@@ -841,14 +916,14 @@ def main() -> None:
         lambda: peer_write_gemm_bshd(
             rank_local_x,
             peer_weight,
-            runtime,
+            peer_runtime,
         ),
         name="rank-local peer-write input error",
         device=device,
     )
     prepared_single_row = prepare_peer_write_gemm_bshd(
         peer_weight,
-        runtime,
+        peer_runtime,
         batch=1,
         sequence=1,
         heads=args.heads,
@@ -872,10 +947,17 @@ def main() -> None:
             lambda: peer_write_gemm_bshd(
                 valid_x,
                 peer_weight,
-                runtime,
+                peer_runtime,
                 bias=rank_local_bias,
             ),
             name="rank-local bias error",
+            device=device,
+        )
+    if peer_weight.shape[0] != peer_weight.shape[1]:
+        transposed_weight = peer_weight.t().contiguous()
+        expect_collective_rejection(
+            lambda: peer_write_gemm_bshd(valid_x, transposed_weight, peer_runtime),
+            name="transposed rectangular weight",
             device=device,
         )
 
@@ -887,7 +969,11 @@ def main() -> None:
                     "status": "passed",
                     "up": args.up,
                     "heads": args.heads,
+                    "peer_out_heads": peer_out_heads,
+                    "pull_in_heads": pull_in_heads,
+                    "pull_out_heads": pull_out_heads,
                     "head_dim": args.head_dim,
+                    "runtime_per_width": args.runtime_per_width,
                     "bias": args.bias,
                     "cases": results,
                     "sbhd_cases": sbhd_results,

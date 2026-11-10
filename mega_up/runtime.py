@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import operator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from threading import Lock
@@ -21,33 +22,39 @@ SUPPORTED_UP_DEGREES = (2, 4, 8)
 # Default symmetric-arena capacity in rows (B*S) per rank. Callers should pass
 # ``max_rows`` explicitly to match their largest local token count.
 DEFAULT_MAX_ROWS = 131_072
-# The pull GEMM tiles N (= hidden) with 256-wide tiles.
+# The GEMM N tiles are 256 wide: the peer-write tiles its exchanged output
+# width with them, the pull its output width.
 HIDDEN_MULTIPLE = 256
 # One warp-wide pull copy with 64-bit lanes moves 128 BF16 columns.
 SHARD_MULTIPLE = 128
 
 
-def unsupported_shape_reason(hidden: int, up: int) -> str | None:
-    """Return why ``(hidden, up)`` cannot run on the kernels, else ``None``."""
+def unsupported_shape_reason(width: int, up: int) -> str | None:
+    """Return why ``width`` columns cannot be exchanged across ``up`` ranks,
+    else ``None``.
+
+    The exchanged width is the output width of a peer-write projection and
+    the input width of a pull projection.
+    """
 
     if up not in SUPPORTED_UP_DEGREES:
         return f"UP must be one of {SUPPORTED_UP_DEGREES}, got {up}"
-    if hidden <= 0 or hidden % up:
-        return f"hidden={hidden} must be positive and divisible by UP={up}"
-    if hidden % HIDDEN_MULTIPLE:
-        return f"hidden={hidden} must be a multiple of {HIDDEN_MULTIPLE}"
-    if (hidden // up) % SHARD_MULTIPLE:
+    if width <= 0 or width % up:
+        return f"width={width} must be positive and divisible by UP={up}"
+    if width % HIDDEN_MULTIPLE:
+        return f"width={width} must be a multiple of {HIDDEN_MULTIPLE}"
+    if (width // up) % SHARD_MULTIPLE:
         return (
-            f"the head shard hidden/UP={hidden // up} must be a multiple of "
+            f"the head shard width/UP={width // up} must be a multiple of "
             f"{SHARD_MULTIPLE}"
         )
     return None
 
 
-def supports_shape(hidden: int, up: int) -> bool:
-    """Whether the kernels support a ``hidden`` x ``hidden`` projection at ``up``."""
+def supports_shape(width: int, up: int) -> bool:
+    """Whether ``width`` columns can be exchanged across ``up`` ranks."""
 
-    return unsupported_shape_reason(hidden, up) is None
+    return unsupported_shape_reason(width, up) is None
 
 
 def _contiguous_stride(shape: Sequence[int]) -> tuple[int, ...]:
@@ -107,7 +114,12 @@ def _barrier(handle) -> None:
 
 @dataclass
 class MegaUPRuntime:
-    """One reusable BF16 symmetric arena for an explicit UP process group."""
+    """One reusable BF16 symmetric arena for an explicit UP process group.
+
+    The arena holds ``max_rows * hidden`` elements per rank. An operation
+    exchanging ``rows`` rows of ``width`` elements fits when
+    ``rows * width <= max_rows * hidden``; ``width`` defaults to ``hidden``.
+    """
 
     group: dist.ProcessGroup
     arena: Tensor
@@ -161,41 +173,54 @@ class MegaUPRuntime:
     def barrier(self) -> None:
         _barrier(self.handle)
 
-    def check_rows(self, rows: int) -> None:
-        if rows <= 0 or rows > self.max_rows:
+    def check_capacity(self, rows: int, width: int) -> None:
+        """Check that ``rows`` rows of ``width`` elements fit the arena."""
+
+        if rows <= 0 or width <= 0 or width % self.up:
             raise ValueError(
-                f"rows must be in [1,{self.max_rows}], got {rows}"
+                "rows and width must be positive and width divisible by "
+                f"UP={self.up}, got rows={rows}, width={width}"
+            )
+        if rows * width > self.max_rows * self.hidden:
+            raise ValueError(
+                f"{rows} rows of {width} elements exceed the arena of "
+                f"max_rows*hidden={self.max_rows}*{self.hidden} elements per rank"
             )
 
-    def slots(self, rows: int) -> Tensor:
-        """``[UP, rows, hidden/UP]`` view of the densely packed arena slots.
+    def slots(self, rows: int, width: int | None = None) -> Tensor:
+        """``[UP, rows, width/UP]`` view of the densely packed arena slots.
 
-        Slot ``p`` starts at element ``p * rows * hidden/UP``. Peer writes
+        Slot ``p`` starts at element ``p * rows * width/UP``. Peer writes
         receive into it source-major and pulls stage into it
         destination-major, so receiving and staging are contiguous copies.
         """
 
-        self.check_rows(rows)
+        width = self.hidden if width is None else int(width)
+        self.check_capacity(rows, width)
+        shard = width // self.up
         return (
             self.arena.view(-1)
-            .narrow(0, 0, self.up * rows * self.shard_hidden)
-            .view(self.up, rows, self.shard_hidden)
+            .narrow(0, 0, self.up * rows * shard)
+            .view(self.up, rows, shard)
         )
 
-    def remote_write_views(self, rows: int) -> tuple[Tensor, ...]:
+    def remote_write_views(
+        self, rows: int, width: int | None = None
+    ) -> tuple[Tensor, ...]:
         """Return this source rank's slot in every peer arena.
 
-        Peer-write receives are source-major: ``[source_rank, B*S, hidden/UP]``
+        Peer-write receives are source-major: ``[source_rank, B*S, width/UP]``
         in the densely packed slots of :meth:`slots`.
         """
 
-        self.check_rows(rows)
-        source_numel = rows * self.shard_hidden
+        width = self.hidden if width is None else int(width)
+        self.check_capacity(rows, width)
+        source_numel = rows * (width // self.up)
         source_offset = self.local_rank * source_numel
         return tuple(
             peer.view(-1)
             .narrow(0, source_offset, source_numel)
-            .view(rows, self.shard_hidden)
+            .view(rows, width // self.up)
             for peer in self.peer_buffers
         )
 
@@ -211,11 +236,8 @@ class MegaUPRuntime:
         """Materialize compact peer writes as ``[B,UP*S,H/UP,D]``."""
 
         rows = int(batch) * int(sequence)
-        self.check_rows(rows)
-        if shard_heads * head_dim != self.shard_hidden:
-            raise ValueError(
-                "shard_heads * head_dim must equal runtime.hidden / UP"
-            )
+        width = self.up * int(shard_heads) * int(head_dim)
+        self.check_capacity(rows, width)
         expected_shape = (
             batch,
             self.up * sequence,
@@ -240,7 +262,7 @@ class MegaUPRuntime:
             )
 
         self.barrier()
-        source_major = self.slots(rows).view(
+        source_major = self.slots(rows, width).view(
             self.up,
             batch,
             sequence,
@@ -287,27 +309,29 @@ class MegaUPRuntime:
         ``index[i]``; packed THD uses ``THDLayout.to_thd_index``.
         """
 
-        self.check_rows(rows)
         self._check_row_index(index, rows)
         total = self.up * rows
         if (
             out.dtype != self.arena.dtype
             or out.device != self.arena.device
             or not out.is_contiguous()
-            or out.numel() != total * self.shard_hidden
+            or out.numel() == 0
+            or out.numel() % total
         ):
             raise ValueError(
                 "out must be a contiguous BF16 tensor on the runtime device "
-                f"with UP*rows*hidden/UP={total * self.shard_hidden} elements"
+                f"with a multiple of UP*rows={total} elements"
             )
+        shard = out.numel() // total
+        self.check_capacity(rows, self.up * shard)
 
         self.barrier()
-        source_major = self.slots(rows).view(total, self.shard_hidden)
+        source_major = self.slots(rows, self.up * shard).view(total, shard)
         torch.index_select(
             source_major,
             0,
             index,
-            out=out.view(total, self.shard_hidden),
+            out=out.view(total, shard),
         )
         self.barrier()
         return out
@@ -326,32 +350,32 @@ class MegaUPRuntime:
         densely packed, so this is a single row gather.
         """
 
-        self.check_rows(rows)
         self._check_row_index(index, rows)
         total = self.up * rows
         if (
             source.ndim != 2
-            or tuple(source.shape) != (total, self.shard_hidden)
+            or int(source.shape[0]) != total
             or source.dtype != self.arena.dtype
             or source.device != self.arena.device
             or not source.is_contiguous()
         ):
             raise ValueError(
-                "source must be a contiguous BF16 tensor on the runtime device "
-                f"with shape {(total, self.shard_hidden)}"
+                "source must be a contiguous 2-D BF16 tensor on the runtime "
+                f"device with UP*rows={total} rows"
             )
+        shard = int(source.shape[1])
         torch.index_select(
             source,
             0,
             index,
-            out=self.slots(rows).view(total, self.shard_hidden),
+            out=self.slots(rows, self.up * shard).view(total, shard),
         )
         self.barrier()
 
     def stage_head_parallel(self, tensor: Tensor) -> tuple[int, int, int, int]:
         """Stage ``[B,UP*S,H/UP,D]`` for remote pull.
 
-        Each local arena holds ``[destination_rank, B*S, hidden/UP]`` in the
+        Each local arena holds ``[destination_rank, B*S, H/UP*D]`` in the
         densely packed slots of :meth:`slots`; peers pull their slot with row
         stride ``B*S``. For ``B=1`` the staging is one contiguous copy.
         """
@@ -371,12 +395,8 @@ class MegaUPRuntime:
             )
         sequence = global_sequence // self.up
         rows = batch * sequence
-        self.check_rows(rows)
-        if shard_heads * head_dim != self.shard_hidden:
-            raise ValueError(
-                "input shard width does not equal runtime.hidden / UP"
-            )
-        self.slots(rows).view(
+        width = self.up * shard_heads * head_dim
+        self.slots(rows, width).view(
             self.up,
             batch,
             sequence,
@@ -401,7 +421,8 @@ class MegaUPRuntime:
         self.barrier()
 
 
-_RUNTIMES: dict[str, MegaUPRuntime] = {}
+# One runtime per process group and ``hidden``.
+_RUNTIMES: dict[tuple[str, int], MegaUPRuntime] = {}
 
 
 def _raise_collective_phase_errors(
@@ -437,7 +458,15 @@ def initialize_runtime(
 ) -> MegaUPRuntime:
     """Collectively allocate the runtime for ``group``.
 
+    The arena holds ``max_rows * hidden`` elements per rank; ``hidden`` is
+    an exchanged width (peer-write ``out_features`` or pull ``in_features``).
     All ranks in the group must call this function with identical arguments.
+
+    A group can hold several runtimes, one per ``hidden``, each with its own
+    arena: projections of different exchanged widths either share a runtime
+    sized for the widest of them or use one runtime each. A call with the
+    ``hidden`` of an existing runtime returns that runtime and must repeat
+    its ``max_rows`` and device.
     """
 
     if not dist.is_initialized():
@@ -447,14 +476,14 @@ def initialize_runtime(
     collective_device = torch.device(
         "cuda", torch.cuda.current_device()
     )
-    key = _group_key(group)
-    existing = _RUNTIMES.get(key)
+    group_key = _group_key(group)
     normalized_device: torch.device | None = None
     local_error: str | None = None
     try:
+        hidden = operator.index(hidden)
         reason = unsupported_shape_reason(hidden, up)
         if reason is not None:
-            raise ValueError(reason)
+            raise ValueError(f"hidden: {reason}")
         if max_rows <= 0:
             raise ValueError(
                 f"max_rows must be positive, got {max_rows}"
@@ -488,13 +517,15 @@ def initialize_runtime(
             )
     except (RuntimeError, TypeError, ValueError) as error:
         local_error = f"{type(error).__name__}: {error}"
+    existing = (
+        _RUNTIMES.get((group_key, hidden)) if local_error is None else None
+    )
     compatible = (
         local_error is None
         and (
             existing is None
             or (
-                existing.hidden == hidden
-                and existing.max_rows == max_rows
+                existing.max_rows == max_rows
                 and existing.up == up
                 and existing.device == normalized_device
             )
@@ -536,8 +567,8 @@ def initialize_runtime(
         raise RuntimeError("Mega-UP runtime cache state differs across ranks")
     if any(not state[1] for state in cache_states):
         raise RuntimeError(
-            "Mega-UP runtime was already initialized with incompatible "
-            "arguments"
+            f"the group already has a Mega-UP runtime for hidden={hidden} "
+            "with a different max_rows or device"
         )
     if existing is not None:
         return existing
@@ -619,7 +650,7 @@ def initialize_runtime(
         local_rank=local_rank,
         up=up,
     )
-    _RUNTIMES[key] = runtime
+    _RUNTIMES[(group_key, hidden)] = runtime
     return runtime
 
 

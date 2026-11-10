@@ -3,7 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Two fused SM100 GEMM/Ulysses communication kernels."""
+"""Two fused GEMM/Ulysses communication kernels."""
 
 from .ops import (
     PreparedHeadShardPullGemm,
@@ -36,7 +36,7 @@ from .runtime import (
     unsupported_shape_reason,
 )
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "DEFAULT_MAX_ROWS",

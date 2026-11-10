@@ -8,7 +8,9 @@
 
 The pull kernel only needs raw peer addresses, so a UP group is emulated on
 one GPU with ``up`` local ``[up, peer_rows, hidden/up]`` buffers. That runs
-the exact kernel under test without NCCL or symmetric memory.
+the exact kernel under test without NCCL or symmetric memory. ``hidden`` is
+the pulled width K; ``--out-features`` sets N for a rectangular ``[N, K]``
+weight.
 
 Every call is checked three ways:
 
@@ -28,6 +30,7 @@ Examples::
 
     python tests/run_pull_gemm_contention.py --hidden 2048 --iters 200 --contention
     python tests/run_pull_gemm_contention.py --hidden 4096 --iters 100 --perf
+    python tests/run_pull_gemm_contention.py --hidden 4096 --out-features 2048 --perf
     python tests/run_pull_gemm_contention.py --kernel-file /path/to/old.py \\
         --hidden 2048 --iters 200 --contention
 """
@@ -50,6 +53,12 @@ SM_MARGIN = 16
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--hidden", type=int, default=2048)
+    parser.add_argument(
+        "--out-features",
+        type=int,
+        default=0,
+        help="output width N of the [N, hidden] weight (default: hidden)",
+    )
     parser.add_argument("--up", type=int, default=8)
     parser.add_argument(
         "--rank", type=int, default=None, help="emulated rank (default: UP - 1)"
@@ -166,13 +175,14 @@ def main() -> None:
     device = torch.device("cuda", torch.cuda.current_device())
     capability = torch.cuda.get_device_capability(device)
     if capability[0] not in (10, 11):
-        raise RuntimeError(f"SM100/SM110 required, got {capability}")
+        raise RuntimeError(f"unsupported GPU (compute capability {capability})")
     torch.manual_seed(args.seed)
     module = load_kernel_module(args.kernel_file)
     print(f"kernel={module.__file__}")
     print(f"revision={module.IMPLEMENTATION_REVISION}")
 
     up, hidden, rows = args.up, args.hidden, args.rows
+    out_features = args.out_features or hidden
     shard_k = hidden // up
     peer_rows = args.peer_rows or rows
     if peer_rows < rows:
@@ -188,10 +198,12 @@ def main() -> None:
         [peer.data_ptr() for peer in peers], dtype=torch.uint64, device=device
     )
     weight = (
-        torch.randn(hidden, hidden, device=device) * (1.0 / hidden**0.5)
+        torch.randn(out_features, hidden, device=device) * (1.0 / hidden**0.5)
     ).to(torch.bfloat16)
     bias = (
-        torch.randn(hidden, device=device).to(torch.bfloat16) if args.bias else None
+        torch.randn(out_features, device=device).to(torch.bfloat16)
+        if args.bias
+        else None
     )
     x_ref = torch.cat(
         [peers[source][args.rank, :rows, :] for source in range(up)], dim=1
@@ -201,13 +213,15 @@ def main() -> None:
     if bias is not None:
         out_ref32 += bias.float()
 
-    out = torch.empty(rows, hidden, device=device, dtype=torch.bfloat16)
+    out = torch.empty(rows, out_features, device=device, dtype=torch.bfloat16)
     dy = torch.empty(rows, hidden, device=device, dtype=torch.bfloat16)
     total_sms = torch.cuda.get_device_properties(device).multi_processor_count
     max_active_ctas = max(2, ((total_sms - SM_MARGIN) // 2) * 2)
     epochs = 512
 
     def make():
+        # hidden= is the pulled width K; older --kernel-file revisions require
+        # it (and a square weight), the current one only checks it.
         return module.compile_headshard_pull_gemm(
             peer_table,
             weight,
@@ -233,7 +247,8 @@ def main() -> None:
     print(
         f"compiled in {time.perf_counter() - started:.1f}s "
         f"c_stages={compiled.num_c_stages} ab_stages={compiled.num_ab_stages} "
-        f"ctas={max_active_ctas} rows={rows} hidden={hidden} up={up} "
+        f"ctas={max_active_ctas} rows={rows} hidden={hidden} "
+        f"out_features={out_features} up={up} "
         f"bulk={compiled.enable_bulk_pull} rows_per_ticket={compiled.pull_rows_per_ticket} "
         f"col_chunks={compiled.pull_col_chunks} bias={bias is not None}"
     )
@@ -247,6 +262,7 @@ def main() -> None:
     result: dict[str, object] = {
         "revision": module.IMPLEMENTATION_REVISION,
         "hidden": hidden,
+        "out_features": out_features,
         "rows": rows,
         "up": up,
         "c_stages": args.c_stages,
@@ -344,8 +360,8 @@ def main() -> None:
             times.append(start.elapsed_time(end) * 1000.0)
         median = statistics.median(times)
         print(
-            f"[PERF] hidden={hidden} rows={rows}: median={median:.1f}us "
-            f"min={min(times):.1f}us"
+            f"[PERF] hidden={hidden} out_features={out_features} rows={rows}: "
+            f"median={median:.1f}us min={min(times):.1f}us"
         )
         result["perf_us"] = {"median": median, "min": min(times)}
         if stress is not None:
@@ -364,8 +380,8 @@ def main() -> None:
                 contended.append(start.elapsed_time(end) * 1000.0)
             cmedian = statistics.median(contended)
             print(
-                f"[PERF-CONTENDED] hidden={hidden} rows={rows}: "
-                f"median={cmedian:.1f}us min={min(contended):.1f}us"
+                f"[PERF-CONTENDED] hidden={hidden} out_features={out_features} "
+                f"rows={rows}: median={cmedian:.1f}us min={min(contended):.1f}us"
             )
             result["perf_contended_us"] = {"median": cmedian, "min": min(contended)}
 

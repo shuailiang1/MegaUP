@@ -12,9 +12,10 @@ project-authored files are MIT-licensed.
 - Copyright: 2025-2026, QuACK team
 - Local file: `mega_up/kernels/peer_write_gemm.py`
 
-The local file retains the SM100 GEMM structure and selected helpers from
+The local file retains the GEMM structure and selected helpers from
 QuACK 0.4.0. It removes unused dtype and epilogue paths, carries compatibility
-code for CUTLASS DSL 4.4.2, and adds CLC scheduling and peer-routed stores.
+code for CUTLASS DSL 4.4.2, and adds dynamic tile scheduling and peer-routed
+stores.
 The Apache-2.0 text is in `licenses/Apache-2.0.txt`.
 
 ## NVIDIA CUTLASS CuTe DSL examples
@@ -23,7 +24,7 @@ The Apache-2.0 text is in `licenses/Apache-2.0.txt`.
 - License: BSD-3-Clause
 - Copyright: 2025-2026 NVIDIA CORPORATION & AFFILIATES
 
-QuACK's SM100 GEMM is based on the persistent dense GEMM example of CUTLASS
+QuACK's GEMM is based on the persistent dense GEMM example of CUTLASS
 CuTe DSL. The corresponding license text is in
 `licenses/NVIDIA-CUTLASS-BSD-3-Clause.txt`.
 
@@ -39,6 +40,8 @@ Mega-UP imports, but does not vendor:
 
 - PyTorch (`torch`)
 - NVIDIA CUTLASS DSL (`nvidia-cutlass-dsl`)
+- Apache TVM FFI (`apache-tvm-ffi`), used by the CUTLASS DSL export of the
+  peer-write kernel
 - CUDA Python (`cuda-python`)
 
 Those packages remain subject to their own distribution terms.

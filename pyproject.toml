@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mega-up"
-version = "0.2.0"
-description = "Fused SM100 GEMM and Ulysses all-to-all kernels"
+version = "0.3.0"
+description = "Fused GEMM and Ulysses all-to-all kernels"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT AND Apache-2.0"
@@ -33,7 +33,8 @@ classifiers = [
 ]
 dependencies = [
     "torch>=2.7",
-    "nvidia-cutlass-dsl>=4.4.2,<4.5",
+    "nvidia-cutlass-dsl>=4.4.2,<4.9",
+    "apache-tvm-ffi>=0.1.8",
     "cuda-python>=12.9,<14",
 ]
 
@@ -46,4 +47,4 @@ include = ["mega_up*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["sm100: requires SM100/SM110 and torchrun"]
+markers = ["gpu: requires supported GPUs on one node and torchrun"]

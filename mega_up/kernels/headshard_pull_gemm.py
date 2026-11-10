@@ -4,10 +4,10 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Warp-specialized single-kernel head-shard pull + SM100 BF16 GEMM.
+"""Warp-specialized single-kernel head-shard pull + BF16 GEMM.
 
 The kernel computes ``out = dy @ weight.T (+ bias)`` where ``dy``, the dense
-``[M, hidden]`` input, is assembled inside the same launch from the head
+``[M, K]`` input, is assembled inside the same launch from the head
 shards that every peer staged in its symmetric buffer:
 
 * ``logical_m`` is a runtime value (``dy``/``out`` are shape-dynamic in M and
@@ -51,7 +51,7 @@ from cuda.bindings.driver import CUstream
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm, nvvm
 
-IMPLEMENTATION_REVISION = "headshard-pull-sm100-v7-deep-narrow-tickets"
+IMPLEMENTATION_REVISION = "headshard-pull-v7-deep-narrow-tickets"
 
 WARP_SIZE = 32
 EPILOGUE_WARPS = (0, 1, 2, 3)
@@ -99,7 +99,7 @@ PULL_DEEP_MAX_SHARD_K = 256
 # column chunks.
 PULL_MAX_ELEMENTS_IN_FLIGHT = 4 * 3072
 
-# Each stage gathers one complete ``hidden``-element row from all peer shards
+# Each stage gathers one complete K-element row from all peer shards
 # into contiguous SMEM, then emits one SMEM-to-output bulk store of the row.
 # Three row stages expose 3 * UP peer requests per CTA. The bulk ring is only
 # used for the row lengths it was tuned on; other sizes pull with per-lane
@@ -172,8 +172,8 @@ def _vector_pull_rows_per_ticket(pull_rows_per_ticket: int, shard_k: int) -> int
     emits a 2.2 KB stack frame and the pull GEMM runs at 1.7x the dense GEMM
     instead of 1.2x), so wide shards pull 4 rows per ticket. Up to
     ``PULL_DEEP_MAX_SHARD_K`` 8 rows keep too few bytes in flight to cover
-    the NVLink load latency (hidden 2048 / U = 8 pulled at 385 GB/s with 8
-    rows and 545 GB/s with 16), so the narrowest shards pull 16 rows.
+    the NVLink load latency (16 rows raised the hidden 2048 / U = 8 pull
+    throughput by about 40%), so the narrowest shards pull 16 rows.
     """
     if pull_rows_per_ticket >= 8 and shard_k > PULL_PREFETCH_MAX_SHARD_K:
         return 4
@@ -320,7 +320,7 @@ def _cp_async_bulk_s2g(
 
 
 class HeadShardPullGemmKernel:
-    """Warp-specialized SM100 BF16 GEMM with head-shard materialization.
+    """Warp-specialized BF16 GEMM with head-shard materialization.
 
     Steady-state warp roles (8 warps / CTA):
 
@@ -359,7 +359,7 @@ class HeadShardPullGemmKernel:
         # Column chunks a group of pulled rows is split into (vector pull).
         self.pull_col_chunks = int(pull_col_chunks)
         self.pull_rows_in_flight = int(pull_rows_in_flight)
-        # Row length (= hidden) gathered by one bulk-pull stage.
+        # Row length (= K) gathered by one bulk-pull stage.
         self.bulk_row_elements = int(bulk_row_elements)
         self.tile_n = tile_n
         self.tile_k = tile_k
@@ -701,9 +701,9 @@ class HeadShardPullGemmKernel:
             n_tile_cluster_span = cutlass.Int32(self.cluster_shape_mn[1])
             n_tile_cluster_offset = block_in_cluster_coord_vmnk[2]
 
-        hidden = mA_mkl.shape[1]
+        k_total = mA_mkl.shape[1]
         n = mC_mnl.shape[1]
-        shard_k = hidden // up
+        shard_k = k_total // up
         num_m_tiles = (logical_m + self.tile_m - 1) // self.tile_m
         num_n_tiles = n // self.tile_n
         num_n_tile_clusters = (
@@ -1114,7 +1114,7 @@ class HeadShardPullGemmKernel:
                                             rank_base_row_i64,
                                             chunk_first_token + group_idx * pull_rows_in_flight,
                                             peer,
-                                            hidden,
+                                            k_total,
                                             shard_k,
                                             pull_rows_in_flight,
                                             col_chunk * pull_chunk_k,
@@ -1130,7 +1130,7 @@ class HeadShardPullGemmKernel:
                                     chunk_first_token,
                                     logical_m,
                                     peer,
-                                    hidden,
+                                    k_total,
                                     shard_k,
                                     pull_rows_per_ticket,
                                 )
@@ -1144,7 +1144,7 @@ class HeadShardPullGemmKernel:
                                 chunk_first_token,
                                 logical_m,
                                 peer,
-                                hidden,
+                                k_total,
                                 shard_k,
                                 pull_rows_per_ticket,
                             )
@@ -1543,7 +1543,7 @@ class HeadShardPullGemmKernel:
         rank_base_row_i64: cutlass.Int64,
         first_token: cutlass.Int32,
         peer: cutlass.Constexpr[int],
-        hidden: cutlass.Constexpr[int],
+        k_total: cutlass.Constexpr[int],
         shard_k: cutlass.Constexpr[int],
         num_rows: cutlass.Constexpr[int],
         col_offset: cutlass.Constexpr[int],
@@ -1559,7 +1559,7 @@ class HeadShardPullGemmKernel:
         src_offset_i64 = (rank_base_row_i64 + first_token_i64) * cutlass.Int64(
             shard_k
         ) + cutlass.Int64(col_offset)
-        dst_offset_i64 = first_token_i64 * cutlass.Int64(hidden) + cutlass.Int64(
+        dst_offset_i64 = first_token_i64 * cutlass.Int64(k_total) + cutlass.Int64(
             peer * shard_k + col_offset
         )
         fragments = []
@@ -1569,7 +1569,7 @@ class HeadShardPullGemmKernel:
                 src_offset_i64 + cutlass.Int64(row * shard_k), divby=PULL_DIVBY
             )
             dst_offset = cute.assume(
-                dst_offset_i64 + cutlass.Int64(row * hidden), divby=PULL_DIVBY
+                dst_offset_i64 + cutlass.Int64(row * k_total), divby=PULL_DIVBY
             )
             src = pull_thr_copy.partition_S(
                 cute.make_tensor(peer_ptr + src_offset, cute.make_layout(num_cols))
@@ -1595,7 +1595,7 @@ class HeadShardPullGemmKernel:
         first_token: cutlass.Int32,
         logical_m: cutlass.Int32,
         peer: cutlass.Constexpr[int],
-        hidden: cutlass.Constexpr[int],
+        k_total: cutlass.Constexpr[int],
         shard_k: cutlass.Constexpr[int],
         num_rows: cutlass.Constexpr[int],
     ) -> None:
@@ -1609,7 +1609,7 @@ class HeadShardPullGemmKernel:
                     divby=PULL_DIVBY,
                 )
                 dst_offset = cute.assume(
-                    token_i64 * cutlass.Int64(hidden)
+                    token_i64 * cutlass.Int64(k_total)
                     + cutlass.Int64(peer) * cutlass.Int64(shard_k),
                     divby=PULL_DIVBY,
                 )
@@ -1645,11 +1645,11 @@ class HeadShardPullGemmKernel:
         tickets_per_m_tile: cutlass.Int32,
     ) -> None:
         """Full-row bulk pull worker with a predicated tail fallback."""
-        hidden = dy_mkl.shape[1]
-        shard_k = hidden // up
+        k_total = dy_mkl.shape[1]
+        shard_k = k_total // up
         bulk_batches = (pull_rows_per_ticket + BULK_PULL_STAGES - 1) // BULK_PULL_STAGES
         shard_bytes = shard_k * 2
-        row_bytes = hidden * 2
+        row_bytes = k_total * 2
         rank_base_row_i64 = cutlass.Int64(rank) * cutlass.Int64(peer_rows)
         peer_addresses = cute.make_rmem_tensor(cute.make_layout(up), cutlass.Int64)
         for peer in cutlass.range_constexpr(up):
@@ -1721,7 +1721,7 @@ class HeadShardPullGemmKernel:
                         stage_phase = bulk_phases[stage]
                         cute.arch.mbarrier_wait(stage_mbar, stage_phase)
                         bulk_phases[stage] = stage_phase ^ cutlass.Int32(1)
-                        dst_offset_i64 = cutlass.Int64(token) * cutlass.Int64(hidden)
+                        dst_offset_i64 = cutlass.Int64(token) * cutlass.Int64(k_total)
                         dst_offset = cute.assume(dst_offset_i64, divby=PULL_DIVBY)
                         with cute.arch.elect_one():
                             _cp_async_bulk_s2g(
@@ -1790,7 +1790,7 @@ class HeadShardPullGemmKernel:
                         chunk_first_token,
                         logical_m,
                         peer,
-                        hidden,
+                        k_total,
                         shard_k,
                         pull_rows_per_ticket,
                     )
@@ -1915,8 +1915,8 @@ class HeadShardPullGemmKernel:
         loop remains unchanged. This path is cold when every cursor has an
         owner and correctness-critical when CLC cancels one before launch.
         """
-        hidden = dy_mkl.shape[1]
-        shard_k = hidden // up
+        k_total = dy_mkl.shape[1]
+        shard_k = k_total // up
         rank_base_row_i64 = cutlass.Int64(rank) * cutlass.Int64(peer_rows)
         cursor_shard = (primary_cursor_shard + cutlass.Int32(1)) % cutlass.Int32(
             PULL_CURSOR_SHARDS
@@ -1956,7 +1956,7 @@ class HeadShardPullGemmKernel:
                         chunk_first_token,
                         logical_m,
                         peer,
-                        hidden,
+                        k_total,
                         shard_k,
                         pull_rows_per_ticket,
                     )
@@ -2369,7 +2369,8 @@ class CompiledHeadShardPullGemm:
     bias_arg: object
     logical_m: int
     m_rows: int
-    hidden: int
+    n: int
+    k: int
     rank: int
     up: int
     tile_m: int
@@ -2445,7 +2446,7 @@ def compile_headshard_pull_gemm(
     logical_m: int,
     rank: int,
     up: int,
-    hidden: int,
+    hidden: int | None = None,
     bias: torch.Tensor | None = None,
     tile_m: int = DEFAULT_TILE_M,
     tile_n: int = DEFAULT_TILE_N,
@@ -2479,11 +2480,14 @@ def compile_headshard_pull_gemm(
     TMA out-of-bounds handling and dynamic pull-ready counts. No padding is
     allowed in M, N, or K at the call site.
 
-    ``weight`` follows the standard ``nn.Linear`` layout and the kernel
-    computes ``dy @ weight.T`` without materializing a transposed copy. An
-    optional ``(hidden,)`` BF16 ``bias`` is added to the FP32 accumulator
-    before the single rounding to BF16, as ``torch.nn.functional.linear``
-    does.
+    ``weight`` follows the standard ``nn.Linear`` layout ``[N, K]`` and the
+    kernel computes ``dy @ weight.T`` without materializing a transposed copy:
+    ``dy`` is the pulled ``[M, K]`` input and ``out`` the ``[M, N]`` output.
+    An optional ``(N,)`` BF16 ``bias`` is added to the FP32 accumulator before
+    the single rounding to BF16, as ``torch.nn.functional.linear`` does.
+
+    ``hidden`` is optional and only checked: callers that pass the pulled
+    width explicitly must pass K.
     """
     global _KERNEL_COMPILE_COUNT
 
@@ -2493,28 +2497,36 @@ def compile_headshard_pull_gemm(
         raise ValueError(f"rank must be in [0, {up}), got {rank}")
     if logical_m <= 0:
         raise ValueError(f"logical_m must be positive, got {logical_m}")
-    if hidden <= 0 or hidden % up != 0:
-        raise ValueError(f"hidden={hidden} must be positive and divisible by up={up}")
+    if weight.ndim != 2:
+        raise ValueError(f"weight must be 2-D [N, K], got {tuple(weight.shape)}")
+    n, k = int(weight.shape[0]), int(weight.shape[1])
+    if hidden is not None and hidden != k:
+        raise ValueError(
+            f"hidden={hidden} must equal the pulled width K={k} of the "
+            f"[N, K] weight {tuple(weight.shape)}"
+        )
+    if k <= 0 or k % up != 0:
+        raise ValueError(f"K={k} must be positive and divisible by up={up}")
     if peer_rows is None:
         peer_rows = logical_m
     if peer_rows < logical_m:
         raise ValueError(f"peer_rows={peer_rows} must be >= logical_m={logical_m}")
-    shard_k = hidden // up
-    if shard_k % PULL_DIVBY != 0 or hidden % PULL_DIVBY != 0:
+    shard_k = k // up
+    if shard_k % PULL_DIVBY != 0 or k % PULL_DIVBY != 0:
         raise ValueError(
-            "the BF16 pull requires hidden and hidden/up to be divisible "
-            f"by {PULL_DIVBY} elements, got hidden={hidden}, shard_k={shard_k}"
+            "the BF16 pull requires K and K/up to be divisible "
+            f"by {PULL_DIVBY} elements, got K={k}, shard_k={shard_k}"
         )
-    if hidden % tile_k != 0:
-        raise ValueError(f"hidden={hidden} must be divisible by tile_k={tile_k}")
+    if k % tile_k != 0:
+        raise ValueError(f"K={k} must be divisible by tile_k={tile_k}")
 
     if tile_m not in (64, 128):
-        raise ValueError(f"SM100 1-CTA tile_m must be 64 or 128, got {tile_m}")
+        raise ValueError(f"1-CTA tile_m must be 64 or 128, got {tile_m}")
     if tile_n < 32 or tile_n > 256 or tile_n % 32 != 0:
         raise ValueError(f"tile_n must be a multiple of 32 in [32, 256], got {tile_n}")
-    if hidden % tile_n != 0:
+    if n <= 0 or n % tile_n != 0:
         raise ValueError(
-            f"this implementation requires hidden/N={hidden} divisible by tile_n={tile_n}"
+            f"this implementation requires N={n} divisible by tile_n={tile_n}"
         )
     if pull_chunk_m <= 0 or tile_m % pull_chunk_m != 0:
         raise ValueError(f"pull_chunk_m={pull_chunk_m} must divide tile_m={tile_m}")
@@ -2530,14 +2542,14 @@ def compile_headshard_pull_gemm(
             f"to be a multiple of 4, got {pull_rows_per_ticket}"
         )
     bulk_pull_eligible = bool(
-        hidden in BULK_PULL_TUNED_ROW_ELEMENTS
+        k in BULK_PULL_TUNED_ROW_ELEMENTS
         and (shard_k * 2) % 16 == 0
         and pull_rows_per_ticket >= BULK_PULL_STAGES
     )
     enable_bulk_pull = bool(enable_bulk_pull and bulk_pull_eligible)
     if shard_k % (WARP_SIZE * PULL_MIN_ELEMENTS_PER_LANE) != 0:
         raise ValueError(
-            "vectorized BF16 peer pull expects hidden/up to be divisible by "
+            "vectorized BF16 peer pull expects K/up to be divisible by "
             f"{WARP_SIZE * PULL_MIN_ELEMENTS_PER_LANE} elements, got shard_k={shard_k}"
         )
     pull_col_chunks = 1
@@ -2575,25 +2587,21 @@ def compile_headshard_pull_gemm(
     _check_bf16_cuda_contiguous("out", out)
     _check_bf16_cuda_contiguous("dy", dy)
 
-    if tuple(weight.shape) != (hidden, hidden):
+    if tuple(out.shape) != (logical_m, n):
         raise ValueError(
-            f"weight.shape must be {(hidden, hidden)}, got {tuple(weight.shape)}"
+            f"out.shape must be {(logical_m, n)}, got {tuple(out.shape)}"
         )
-    if tuple(out.shape) != (logical_m, hidden):
+    if tuple(dy.shape) != (logical_m, k):
         raise ValueError(
-            f"out.shape must be {(logical_m, hidden)}, got {tuple(out.shape)}"
-        )
-    if tuple(dy.shape) != (logical_m, hidden):
-        raise ValueError(
-            f"dy.shape must be {(logical_m, hidden)}, got {tuple(dy.shape)}"
+            f"dy.shape must be {(logical_m, k)}, got {tuple(dy.shape)}"
         )
     if not (peer_address_table.device == weight.device == out.device == dy.device):
         raise ValueError("all tensors must be on the same CUDA device")
     if bias is not None:
         _check_bf16_cuda_contiguous("bias", bias)
-        if tuple(bias.shape) != (hidden,) or bias.device != out.device:
+        if tuple(bias.shape) != (n,) or bias.device != out.device:
             raise ValueError(
-                f"bias must have shape {(hidden,)} on {out.device}, got "
+                f"bias must have shape {(n,)} on {out.device}, got "
                 f"{tuple(bias.shape)} on {bias.device}"
             )
         if bias.data_ptr() % 16:
@@ -2619,7 +2627,7 @@ def compile_headshard_pull_gemm(
     workspace_ready_event = torch.cuda.Event()
     workspace_ready_event.record(torch.cuda.current_stream(out.device))
 
-    # CuTe SM100 dense GEMM convention:
+    # CuTe dense GEMM convention:
     # A = [M,K,L], B = [N,K,L], C = [M,N,L].
     dy_3d_view = dy.unsqueeze(-1)
     weight_t_view = weight.unsqueeze(-1)
@@ -2661,7 +2669,7 @@ def compile_headshard_pull_gemm(
         pull_col_chunks=pull_col_chunks,
         pull_rows_in_flight=pull_rows_in_flight,
         enable_bulk_pull=enable_bulk_pull,
-        bulk_row_elements=hidden,
+        bulk_row_elements=k,
         enable_clc=enable_clc,
         clc_sched_stages=clc_sched_stages,
     )
@@ -2670,10 +2678,10 @@ def compile_headshard_pull_gemm(
             "non-divisible logical_m requires TMA-store tail OOB handling; "
             "enable use_tma_store or use an M divisible by tile_m"
         )
-    if not op.use_tma_store and (hidden // tile_n) % 2 != 0:
+    if not op.use_tma_store and (n // tile_n) % 2 != 0:
         raise ValueError(
             "an odd number of N tiles requires TMA-store OOB handling; "
-            f"got hidden/tile_n={hidden // tile_n}"
+            f"got N/tile_n={n // tile_n}"
         )
     if not op.use_tma_store and bias is not None:
         raise ValueError("a bias requires the TMA-store epilogue")
@@ -2682,7 +2690,8 @@ def compile_headshard_pull_gemm(
         IMPLEMENTATION_REVISION,
         rank,
         up,
-        hidden,
+        n,
+        k,
         tile_m,
         tile_n,
         tile_k,
@@ -2746,7 +2755,8 @@ def compile_headshard_pull_gemm(
         bias_arg=bias_arg,
         logical_m=logical_m,
         m_rows=logical_m,
-        hidden=hidden,
+        n=n,
+        k=k,
         rank=rank,
         up=up,
         tile_m=tile_m,

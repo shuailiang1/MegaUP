@@ -1,6 +1,6 @@
 # Mega-UP
 
-Mega-UP provides two SM100 CuTe DSL kernels that fuse an attention
+Mega-UP provides two CuTe DSL kernels that fuse an attention
 projection with the data movement of a Ulysses all-to-all:
 
 1. **Peer-write GEMM** (sequence-parallel to head-parallel). It computes
@@ -25,64 +25,96 @@ does not contain attention kernels, model code or framework integration.
 
 | Layout | `*peer_write_gemm_*`: input to output | `*headshard_pull_gemm_*`: input to output | Layout copies |
 | --- | --- | --- | --- |
-| BSHD | `[B, S, H, D]` to `[B, U*S, H/U, D]` | `[B, U*S, H/U, D]` to `[B, S, H, D]` | contiguous for B = 1, strided for B > 1 |
-| SBHD | `[S, B, H, D]` to `[U*S, B, H/U, D]` | `[U*S, B, H/U, D]` to `[S, B, H, D]` | contiguous |
-| THD (packed) | `[T, H, D]` to `[U*T, H/U, D]` | `[U*T, H/U, D]` to `[T, H, D]` | contiguous, or one row gather with a `THDLayout` |
+| BSHD | `[B, S, H, D]` to `[B, U*S, N/(U*D), D]` | `[B, U*S, H/U, D]` to `[B, S, N/D, D]` | contiguous for B = 1, strided for B > 1 |
+| SBHD | `[S, B, H, D]` to `[U*S, B, N/(U*D), D]` | `[U*S, B, H/U, D]` to `[S, B, N/D, D]` | contiguous |
+| THD (packed) | `[T, H, D]` to `[U*T, N/(U*D), D]` | `[U*T, H/U, D]` to `[T, N/D, D]` | contiguous, or one row gather with a `THDLayout` |
 
-`S` and `T` are the rank-local sequence length and token count; every rank of
-the group uses the same shape.
+The weight `W` is `[N, K]` (the `torch.nn.functional.linear` layout) with
+`K = H*D`, and it does not have to be square: grouped-query K and V
+projections, fused QKV projections and output projections whose input width
+differs from the model width are all supported. `S` and `T` are the rank-local
+sequence length and token count; every rank of the group uses the same shape.
 
 ## Supported configurations
 
-A configuration is the hidden size `hidden = H * D` of a square projection
-(`W` is `[hidden, hidden]`) and the Ulysses degree `U`:
+The ranks exchange the output of a peer-write projection and the input of a
+pull projection, so the exchanged width is `N` for a peer-write and `K` for a
+pull. That width has to split into equal head shards; the other width stays
+on each rank and only has to fit the GEMM tiles:
 
 | Constraint | Why |
 | --- | --- |
 | `U` in {2, 4, 8}, ranks of one node with peer access | symmetric memory over NVLink |
-| `hidden` a multiple of 256 | the pull GEMM tiles N with 256-wide tiles |
-| head shard `hidden / U` a multiple of 128 | one warp-wide 64-bit pull copy moves 128 columns |
+| exchanged width a multiple of 256 | the peer-write GEMM tiles N with 256-wide tiles |
+| head shard `width / U` a multiple of 128 and of `D` | one warp-wide 64-bit pull copy moves 128 columns; each rank receives whole heads |
+| pull output width `N` a multiple of 256 and of `D` | the pull GEMM tiles N with 256-wide tiles |
+| peer-write input width `K` a multiple of 8 | TMA rows must be 16-byte aligned |
 | BF16 activations, weight and bias, FP32 accumulation | |
 
-`mega_up.supports_shape(hidden, U)` evaluates the rule and
-`mega_up.unsupported_shape_reason(hidden, U)` explains a rejection. The rule
-contains no list of validated sizes: with `head_dim = 128` or `256` every
-head count divisible by `U` is supported, and with `head_dim = 64` every head
-count divisible by `2U`. Examples:
+`mega_up.supports_shape(width, U)` evaluates the rule for an exchanged width
+and `mega_up.unsupported_shape_reason(width, U)` explains a rejection; the
+`prepare_*` functions check every constraint. The rule contains no list of
+validated sizes: with `head_dim = 128` or `256` every exchanged head count
+divisible by `U` is supported, and with `head_dim = 64` every count divisible
+by `2U`. Examples:
 
-| Model (attention projections) | hidden | heads x dim | U = 2 | U = 4 | U = 8 |
+| Model, projection | `W` (`[N, K]`) | exchanged heads x dim | U = 2 | U = 4 | U = 8 |
 | --- | ---: | :---: | :---: | :---: | :---: |
-| Wan2.1 1.3B | 1536 | 12 x 128 | yes | yes | no (12 heads) |
-| LTX-Video | 2048 | 32 x 64 | yes | yes | yes |
-| Flux.1, HunyuanVideo | 3072 | 24 x 128 | yes | yes | yes |
-| Llama-3 8B (Q and O) | 4096 | 32 x 128 | yes | yes | yes |
-| Wan2.1 / Wan2.2 14B, Cosmos-Predict2.5 14B | 5120 | 40 x 128 | yes | yes | yes |
-| Step-Video-T2V | 6144 | 48 x 128 | yes | yes | yes |
-| Llama-3 70B (Q and O) | 8192 | 64 x 128 | yes | yes | yes |
+| Wan2.1 1.3B, Q/K/V/O | 1536 x 1536 | 12 x 128 | yes | yes | no (12 heads) |
+| LTX-Video, Q/K/V/O | 2048 x 2048 | 32 x 64 | yes | yes | yes |
+| Flux.1, HunyuanVideo, Q/K/V/O | 3072 x 3072 | 24 x 128 | yes | yes | yes |
+| Llama-3 8B, Q and O | 4096 x 4096 | 32 x 128 | yes | yes | yes |
+| Llama-3 8B, K or V | 1024 x 4096 | 8 x 128 | yes | yes | yes |
+| Llama-3 8B, fused QKV | 6144 x 4096 | 48 x 128 | yes | yes | yes |
+| Wan2.1 / Wan2.2 14B, Cosmos-Predict2.5 14B, Q/K/V/O | 5120 x 5120 | 40 x 128 | yes | yes | yes |
+| Step-Video-T2V, Q/K/V/O | 6144 x 6144 | 48 x 128 | yes | yes | yes |
+| Llama-3 70B, Q and O | 8192 x 8192 | 64 x 128 | yes | yes | yes |
+| Llama-3 70B, K or V | 1024 x 8192 | 8 x 128 | yes | yes | yes |
+
+A fused QKV projection is one peer-write. The kernel splits the output
+columns into `U` contiguous blocks, and rank `p` receives columns
+`[p*N/U, (p+1)*N/U)`, so the rows of the weight (and the bias) must be grouped
+by rank:
+
+- Rows packed per head as `[H, 3, D]` (each head's query, key and value rows
+  adjacent, the layout of Megatron-style `query_key_value` layers) are
+  already grouped: rank `p` receives heads `[p*H/U, (p+1)*H/U)` as
+  `[..., 3*H/U, D]`, which views as `[..., H/U, 3, D]`.
+- Rows packed as `[3, H, D]` (all query rows, then all key rows, then all
+  value rows, as in `torch.nn.MultiheadAttention.in_proj_weight`) need one row
+  permutation of the weight and the bias beforehand.
+- With grouped-query attention the block of rank `p` holds its `H_q/U` query
+  heads and its `H_kv/U` key and value heads, in the order the caller chose;
+  the received `[..., (H_q + 2*H_kv)/U, D]` tensor splits accordingly.
 
 Both kernels accept an optional bias, which most diffusion-transformer
 attention projections carry. It is added to the FP32 accumulator before the
 single rounding to BF16, exactly like `F.linear(x, W, b)`.
 
 Head shards do not have to align with the 256-wide GEMM tiles: at
-hidden 5120 / U = 8 each rank owns 640 columns, and the peer-write epilogue
+N = 5120 / U = 8 each rank owns 640 columns, and the peer-write epilogue
 routes every 64-column subtile on its own. An odd number of 256-wide N tiles
-(for example hidden 2304 at U = 2) is also supported.
+(for example N = 2304) is also supported.
 
 ## Requirements
 
-- NVIDIA SM100 or SM110 GPUs. SM100 is the validated target; SM110 passes the
-  capability check but has not been validated.
+- A GPU supported by the kernels; `initialize_runtime` checks the device and
+  rejects unsupported ones.
 - All ranks of a Ulysses group on one node and mutually peer-accessible.
 - Python 3.10 or newer.
 - PyTorch 2.7 or newer with NCCL and symmetric-memory support. The runtime
   uses private PyTorch symmetric-memory APIs; revalidate it when upgrading
   PyTorch.
-- NVIDIA CUTLASS DSL `>=4.4.2,<4.5` and CUDA Python `>=12.9,<14`.
+- NVIDIA CUTLASS DSL `>=4.4.2,<4.9` with `apache-tvm-ffi`, and CUDA Python
+  `>=12.9,<14`. Tested combinations: CUTLASS DSL 4.4.2 with apache-tvm-ffi
+  0.1.8, 0.1.9 and 0.1.15, and CUTLASS DSL 4.8.1 (`nvidia-cutlass-dsl[cu13]`
+  for CUDA 13) with apache-tvm-ffi 0.1.15. DSL 4.8.1 needs apache-tvm-ffi
+  0.1.10 or newer and has been validated for U = 2 and 4 (see
+  [Correctness](#correctness)); the DSL releases in between were not run.
 - Contiguous BF16 tensors; a bias must be 16-byte aligned.
 
 The first peer-write compilation temporarily installs, then restores, a
-CUTLASS 4.4.2 argument-converter compatibility shim. Do not compile an
+CUTLASS DSL argument-converter compatibility shim. Do not compile an
 unrelated CuTe DSL kernel concurrently in another Python thread during that
 first call.
 
@@ -92,9 +124,9 @@ first call.
 pip install -e .
 ```
 
-The kernels compile on first use, once per static configuration (hidden size,
-U, with or without bias). The token count is a runtime value: changing the
-sequence length never recompiles.
+The kernels compile on first use, once per static configuration (weight
+shape, U, with or without bias). The token count is a runtime value: changing
+the sequence length never recompiles.
 
 ## Usage
 
@@ -118,30 +150,38 @@ torch.cuda.set_device(local_rank)
 device = torch.device("cuda", local_rank)
 
 U = dist.get_world_size()
-B, S, H, D = 1, 32768, 40, 128          # S: local sequence length
-hidden = H * D
+B, S, D = 1, 32768, 128                   # S: local sequence length
+H, H_kv = 32, 8                           # query and key/value heads
+hidden = H * D                            # model width
 runtime = initialize_runtime(dist.group.WORLD, hidden=hidden, max_rows=B * S, device=device)
 
 torch.manual_seed(0)                      # identical parameters on every rank
-w_v = torch.randn(hidden, hidden, dtype=torch.bfloat16, device=device) / hidden**0.5
-b_v = torch.randn(hidden, dtype=torch.bfloat16, device=device)
-w_o = torch.randn_like(w_v)
-b_o = torch.randn_like(b_v)
+w_v = torch.randn(H_kv * D, hidden, dtype=torch.bfloat16, device=device) / hidden**0.5
+b_v = torch.randn(H_kv * D, dtype=torch.bfloat16, device=device)
+w_o = torch.randn(hidden, H * D, dtype=torch.bfloat16, device=device) / hidden**0.5
+b_o = torch.randn(hidden, dtype=torch.bfloat16, device=device)
 
-# linear + all-to-all: [B, S, H, D] -> [B, U*S, H/U, D]
+# linear + all-to-all: [B, S, H, D] -> [B, U*S, H_kv/U, D]
 v_proj = prepare_peer_write_gemm_bshd(
     w_v, runtime, batch=B, sequence=S, heads=H, head_dim=D, bias=b_v
 )
-# all-to-all + linear: [B, U*S, H/U, D] -> [B, S, H, D]
+# all-to-all + linear: [B, U*S, H/U, D] -> [B, S, hidden/D, D]
 out_proj = prepare_headshard_pull_gemm_bshd(
     w_o, runtime, batch=B, sequence=S, heads=H, head_dim=D, bias=b_o
 )
 
-x = torch.randn(B, S, H, D, dtype=torch.bfloat16, device=device)
-v = v_proj(x)
-attn = v                                   # attention over the full sequence, H/U heads
-y = out_proj(attn)
+x = torch.randn(B, S, H, D, dtype=torch.bfloat16, device=device)  # [B, S, hidden] as heads
+v = v_proj(x)                                                      # [B, U*S, H_kv/U, D]
+attn = torch.randn(B, U * S, H // U, D, dtype=torch.bfloat16, device=device)  # attention output
+y = out_proj(attn)                                                 # [B, S, hidden/D, D]
 ```
+
+The peer-write input only has to factor `K` as `heads * head_dim`, and
+`head_dim` is the head size of the exchanged output. `hidden` sizes the arena
+for the widest exchanged width of the projections that share the runtime (the
+peer-write `N` or the pull `K`). Projections of different exchanged widths
+can also use a runtime each: a process group holds one runtime per `hidden`;
+see [Runtime](#runtime).
 
 `prepare_*` validates the weight, bias and shape on all ranks, compiles the
 kernel if this configuration has not been compiled yet, and binds it to the
@@ -154,8 +194,8 @@ overwritten by the next call (clone it to keep it). `peer_write_gemm_*` and
 
 The APIs are forward-only building blocks and do not register autograd
 formulas; the backward of each projection is the other kernel (the data
-gradient of a peer-write projection is a pull GEMM with weight `W.T`, and
-vice versa).
+gradient of a peer-write projection with weight `W` (`[N, K]`) is a pull GEMM
+with weight `W.T` (`[K, N]`), and vice versa).
 
 Every call is collective: all ranks of the group must issue the same calls in
 the same order. Before any device-side barrier, the APIs exchange the call's
@@ -180,8 +220,8 @@ from mega_up import prepare_headshard_pull_gemm_thd, prepare_peer_write_gemm_thd
 
 v_proj = prepare_peer_write_gemm_thd(w_v, runtime, heads=H, head_dim=D, tokens=T, bias=b_v)
 out_proj = prepare_headshard_pull_gemm_thd(w_o, runtime, heads=H, head_dim=D, tokens=T, bias=b_o)
-head_parallel = v_proj(x)                                               # [U*T, H/U, D]
-y = out_proj(head_parallel)                                             # [T, H, D]
+v = v_proj(x)                                                           # [U*T, H_kv/U, D]
+y = out_proj(attn)                                                      # [T, hidden/D, D]
 ```
 
 The token count is a runtime argument of the kernels, so preparing for a new
@@ -215,8 +255,8 @@ v_proj = prepare_peer_write_gemm_sbhd(
 out_proj = prepare_headshard_pull_gemm_sbhd(
     w_o, runtime, sequence=S, batch=B, heads=H, head_dim=D, bias=b_o
 )
-head_parallel = v_proj(x_sbhd)                                           # [U*S, B, H/U, D]
-y = out_proj(head_parallel)                                              # [S, B, H, D]
+v = v_proj(x_sbhd)                                                       # [U*S, B, H_kv/U, D]
+y = out_proj(attn_sbhd)                                                  # [S, B, hidden/D, D]
 ```
 
 ### BSHD with B > 1
@@ -232,17 +272,17 @@ packed THD avoid it.
 
 ### Peer-write GEMM
 
-The kernel is a persistent 2-CTA SM100 GEMM (256x256 tiles, 2x1 clusters, CLC
-dynamic scheduling) derived from QuACK's SM100 GEMM. Output column block `p`
-(`hidden/U` columns) belongs to rank `p`. The epilogue converts each 128x64
+The kernel is a persistent GEMM (256x256 tiles on 2-CTA clusters, dynamic tile
+scheduling) derived from QuACK's GEMM. Output column block `p`
+(`N/U` columns) belongs to rank `p`. The epilogue converts each 128x64
 accumulator subtile to BF16 and issues one TMA store into the destination
 rank's slot of the symmetric arena:
 
 - Every row of a subtile reaches the peer as one NVLink write, so the subtile
-  width sets the write size. With all eight GPUs exchanging, 64-byte rows
-  (32-column subtiles) sustained about 430 GB/s of peer writes per GPU and
-  128-byte rows (64 columns) about 680 GB/s; wider subtiles gained nothing
-  more. At hidden 2048 / U = 8 the wider subtile took the peer-write kernel
+  width sets the write size. With all eight GPUs exchanging, 128-byte rows
+  (64-column subtiles) sustained about 1.6x the peer-write bandwidth of
+  64-byte rows (32 columns); wider subtiles gained nothing more. At hidden
+  2048 / U = 8 the wider subtile took the peer-write kernel
   from 1.6-1.8x to 1.1-1.2x the dense GEMM, and at 3072 / U = 8 from
   1.16-1.23x to 1.01-1.04x.
 - When the 256-wide N tile divides the head shard, the whole tile goes to one
@@ -281,9 +321,9 @@ cluster share each M tile and multicast A.
   row groups wider than 4 x 3072 elements are copied in column chunks.
   Without the bound, 4096-column shards compiled with a stack frame and the
   16384/U=4 pull GEMM ran at 1.33x the dense GEMM instead of 1.17x.
-- At hidden 4096 a bulk-copy ring (one warp, three full-row SMEM stages,
-  `cp.async.bulk`) replaces the vector copy; it measured faster only for that
-  row length.
+- For 4096-element rows (K = 4096) a bulk-copy ring (one warp, three
+  full-row SMEM stages, `cp.async.bulk`) replaces the vector copy; it
+  measured faster only for that row length.
 - With an odd number of 256-wide N tiles, the second CTA of the last cluster
   computes an out-of-bounds tile: TMA zero-fills its loads and drops its
   stores.
@@ -295,9 +335,15 @@ cluster share each M tile and multicast A.
 ### Runtime
 
 `initialize_runtime` collectively allocates one BF16 symmetric arena of
-`[U, max_rows, hidden/U]` per rank and validates that every rank requested
-the same configuration. Both kernels use densely packed slots (slot `p` at
-`p * rows * hidden/U`): peer writes land source-major, pull inputs are staged
+`max_rows * hidden` elements per rank and validates that every rank requested
+the same configuration. An operation on `rows` rows of exchanged width `w`
+fits when `rows * w <= max_rows * hidden`, so one runtime serves projections
+of different widths. A process group can also hold several runtimes, one per
+`hidden`, each with its own arena (for example `hidden = 3F` for a fused QKV
+projection and `hidden = F` for the output projection); a repeated call with
+the `hidden` of an existing runtime returns that runtime and has to repeat
+its `max_rows`. Both kernels use densely packed slots (slot `p` at
+`p * rows * w/U`): peer writes land source-major, pull inputs are staged
 destination-major. Every operation follows the same protocol:
 
 1. peer writes or peer reads complete, then a symmetric barrier;
@@ -320,16 +366,17 @@ takes about 0.47 ms.
 | Test | Command | Covers |
 | --- | --- | --- |
 | Layout and shape rules (CPU) | `pytest tests/test_layout.py tests/test_shapes.py` | BSHD/SBHD/THD permutations, the shape rule, tile rotation, pull lane/ticket/chunk selection |
-| Distributed correctness | `torchrun --standalone --nproc-per-node=U tests/run_distributed_correctness.py --up U --heads H [--bias]` | both kernels through the one-shot and the prepared APIs (a prepared executable is called on two different inputs), BSHD, SBHD and THD (contiguous and split-sample), bias, collective rejection of rank-local errors |
-| The same, as pytest | `pytest -m sm100 tests/test_distributed.py` | a (hidden, U, bias) matrix; cases with too few GPUs are skipped |
-| Epilogue under SM contention (1 GPU) | `python tests/run_pull_gemm_contention.py --hidden 5120 --up 8 --contention [--bias]` | pull-GEMM output bit-stable across calls while other kernels share the SMs |
+| Distributed correctness | `torchrun --standalone --nproc-per-node=U tests/run_distributed_correctness.py --up U --heads H [--peer-out-heads E] [--pull-in-heads P] [--pull-out-heads Q] [--runtime-per-width] [--bias]` | both kernels through the one-shot and the prepared APIs (a prepared executable is called on two different inputs), square or rectangular weights (peer-write `[E*D, H*D]`, pull `[Q*D, P*D]`), one shared runtime or one runtime per exchanged width, BSHD, SBHD and THD (contiguous and split-sample), bias, collective rejection of rank-local errors |
+| The same, as pytest | `pytest -m gpu tests/test_distributed.py` | a matrix of square and rectangular weights, U and bias; cases with too few GPUs are skipped |
+| Epilogue under SM contention (1 GPU) | `python tests/run_pull_gemm_contention.py --hidden 5120 [--out-features N] --up 8 --contention [--bias]` | pull-GEMM output bit-stable across calls while other kernels share the SMs |
 
 The distributed runner compares against explicit PyTorch references
 (`F.linear` + `all_to_all_single`, and slice-by-slice regroups for THD that do
 not share the library's index tensors) and reports, per check, whether the
 result is bitwise equal.
 
-Results on one 8-GPU SM100 node (CUTLASS DSL 4.4.2, PyTorch 2.13, CUDA 13.2):
+Results on 8-GPU nodes of one type (PyTorch 2.13, CUDA 13.2), with CUTLASS DSL
+4.4.2 unless stated otherwise:
 
 - hidden 1280, 2048, 2304, 2560, 3072, 3328, 4096, 4864, 5120, 6144 and 8192
   with every supported U, with and without bias (48 runs), each with BSHD
@@ -338,18 +385,50 @@ Results on one 8-GPU SM100 node (CUTLASS DSL 4.4.2, PyTorch 2.13, CUDA 13.2):
   length-1 samples, contiguous and split-sample: the pulled input is always
   bitwise equal, and both GEMM outputs, through the one-shot and the prepared
   APIs, are bitwise equal to the reference except for the 34-row cases at
-  hidden 4864-6144 without bias, where cuBLAS runs the reference GEMM with
-  split-K and the results differ by one or two BF16 ulp. The fused GEMMs
-  accumulate K in one pass for every M.
-- With bias, every case is bitwise equal.
+  hidden 4864-6144 without bias, which differ by one or two BF16 ulp because
+  the cuBLAS reference depends on M there (see "Small M" below).
+- With bias, every one of these cases is bitwise equal.
 - The same cases, with and without bias, at other head layouts: 128-dim heads
   x 8 (U = 8, 128-column shards), x 12 (U = 2 and 4) and x 56 (U = 8);
   256-dim heads x 8 (U = 8), x 12 (U = 4), x 20 (U = 2) and x 24 (U = 8);
   64-dim heads x 16 (U = 8) and x 32 (U = 4 and 8). Every check is bitwise
   equal except, again, the 34-row cases at hidden 5120 and 6144 without bias.
+- Rectangular weights (`W` as `[N, K]`), with the BSHD, SBHD and THD cases
+  above: peer-write 6144x4096 (fused grouped-query QKV, U = 8, bias),
+  8192x3072 with pull 3072x4096 (U = 4), 1024x2048 with pull 2048x1024 (U = 2,
+  bias), 5120x2880 with pull 3072x4096 (64-dim heads, U = 8, bias), 2560x1040
+  with pull 1280x2560 (80-dim heads, K not a multiple of 64, U = 2),
+  15360x5120 (fused QKV, U = 8), 8192x2048 with pull 2048x8192 (U = 4, bias),
+  6144x2048 for both kernels (U = 2 and 4) and 2048x6144 for both kernels
+  (U = 4 and 8). Every check is bitwise equal except small-M outputs of the
+  2048x8192 pull, the 5120x5120 pull without bias and both 2048x6144 kernels
+  (see "Small M").
+- One runtime per exchanged width on the same process group
+  (`--runtime-per-width`): 6144x4096 with pull 4096x4096 (U = 8, bias),
+  8192x3072 with pull 3072x4096 (U = 4, bias), 6144x2048 (U = 2 and 4) and
+  2048x6144 (U = 4 and 8). Every check is bitwise equal except the small-M
+  outputs of the 2048x6144 kernels.
+- Small M: the fused kernels accumulate K in one pass for every M, so a row
+  of their output does not depend on the number of rows in the call. The
+  cuBLAS reference does for large K: its result for a small call differs by
+  one or two BF16 ulp from the same rows of its own 4096-row result (seen for
+  K from 4864 to 8192 and calls of 17 to 96 rows; the range depends on the
+  shape). These are exactly the reference outputs the fused kernels differ
+  from, and both kernels reproduce the rows of the 4096-row cuBLAS result bit
+  for bit.
+- CUTLASS DSL 4.8.1 (four GPUs, so U = 2 and 4 only): hidden 1280, 2304 and
+  8192 at U = 2 and 4096 at U = 4, and the U = 2 and U = 4 rectangular
+  configurations above, with a shared runtime and with one runtime per width
+  (12 runs). The outcome is the same as with 4.4.2, including the small-M
+  reference outputs.
 - Contention: 200 calls each at hidden 2304/U=2, 4096/U=8, 5120/U=8 and
-  8192/U=2, with and without bias, while elementwise or mixed elementwise and
-  GEMM kernels run on a side stream: zero changed outputs.
+  8192/U=2, with and without bias, and for the rectangular pulls 3072x4096
+  (U = 4, bias), 2048x8192 (U = 4), 4096x1024 (U = 8, bias) and 1280x4096
+  (U = 8), while elementwise or mixed elementwise and GEMM kernels run on a
+  side stream: zero changed outputs. With CUTLASS DSL 4.8.1: hidden 2048/U=8,
+  2304/U=2 and 5120/U=8 and the rectangular pulls 3072x4096 (U = 4),
+  2048x8192 (U = 4), 4096x1024 (U = 8), 1280x4096 (U = 8) and 6144x2048
+  (U = 4): zero changed outputs.
 
 ### Epilogue regression test
 
@@ -367,12 +446,13 @@ elementwise contention and 72/200 under mixed contention at hidden 2048.
 
 ## Performance
 
-Setup: one 8-GPU SM100 node with NVLink and no other workload,
+Setup: one 8-GPU node with NVLink and no other workload, CUTLASS DSL 4.4.2
+(no performance numbers were measured with 4.8.1),
 `benchmarks/bench_bshd.py` with the packed THD layout and 65,536 tokens per
 rank, 10 warmups and 40 measured iterations. Every configuration ran twice,
-back to back: with the SM clocks of the used GPUs locked at 1500 MHz
-(`nvidia-smi -lgc 1500,1500`) and at the default clocks; the clocks were
-sampled during every run. Every sample is the maximum over the ranks of one
+back to back: with the SM clocks of the used GPUs locked to one frequency
+(`nvidia-smi -lgc`) and at the default clocks; the clocks were sampled during
+every run. Every sample is the maximum over the ranks of one
 CUDA-event interval; the paths are timed in rotating order and the tables show
 medians. Before timing, the benchmark checks the fused outputs against the
 PyTorch pipeline; every configuration below was bitwise equal.
@@ -386,12 +466,10 @@ PyTorch pipeline; every configuration below was bitwise equal.
   NCCL `all_to_all_single` + output copy for the peer-write GEMM, and the
   reverse for the pull GEMM.
 
-Each cell shows the run with the SM clock locked at 1500 MHz, then the run at
-the default clocks. With the lock, most runs at hidden 4096 and above reached
-the board power limit and ran at a median of 1.24-1.47 GHz; because the paths
-alternate within a run, a ratio still compares them at the same clock. At the
-default clocks the median SM clock ranged from 1.28 GHz (power-limited) to
-2.03 GHz.
+Each cell shows the run with the SM clock locked, then the run at the default
+clocks. In both settings most runs at hidden 4096 and above reached the board
+power limit and ran below the locked or the maximum clock; because the paths
+alternate within a run, a ratio still compares them at the same clock.
 
 | hidden | U | peer-write kernel / GEMM | pull kernel / GEMM | peer-write API vs PyTorch | pull API vs PyTorch |
 | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -425,9 +503,8 @@ kernel takes 1.11-1.30x the GEMM from hidden 2560 on and 1.34-1.48x at hidden
 2048 and 2304. The exchange is hardest to hide at small hidden and large U:
 the bytes a rank exchanges grow with `hidden` while the GEMM work grows with
 `hidden^2`, and a larger U sends a larger share, `(U-1)/U`, of the output to
-peers. At hidden 2048 / U = 8 hiding it completely would take about 740 GB/s
-of peer writes per GPU at the default clocks, more than the kernel sustains
-(see [Peer-write GEMM](#peer-write-gemm)).
+peers. At hidden 2048 / U = 8 hiding it completely would take more peer-write
+bandwidth than the kernel sustains (see [Peer-write GEMM](#peer-write-gemm)).
 
 Token count, hidden 5120 / U = 8:
 
@@ -456,6 +533,41 @@ Bias, 65,536 tokens per rank (the PyTorch pipeline adds the bias with
 
 The fused bias costs nothing measurable inside either kernel.
 
+### Rectangular weights
+
+The exchanged bytes per GEMM FLOP scale with `1/K` for a peer-write and with
+`1/N` for a pull, so a rectangular projection costs about what a square one
+with the same `K` (peer-write) or the same `N` (pull) costs. Measured on
+another node of the same type at the default clocks, with the square shapes
+in the same session for reference (65,536 tokens per rank, packed THD):
+
+| Peer-write `W` | pull `W` | U | peer-write kernel / GEMM | pull kernel / GEMM | peer-write API vs PyTorch | pull API vs PyTorch |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 6144x4096 | 4096x4096 | 8 | 0.92 | 1.14 | 2.15 | 1.82 |
+| 15360x5120 | 5120x5120 | 8 | 1.00 | 1.18 | 1.96 | 1.58 |
+| 12288x3072 | 3072x4096 | 4 | 1.01 | 1.20 | 2.32 | 1.97 |
+| 5120x2880 | 3072x4096 | 8 | 1.02 | 1.25 | 2.27 | 1.81 |
+| 1024x4096 | 4096x1024 | 8 | 0.99 | 1.32 | 1.62 | 1.23 |
+| 8192x2048 | 2048x8192 | 4 | 1.21 | 1.26 | 2.43 | 2.35 |
+| 8192x2048 | 2048x8192 | 8 | 1.23 | 1.30 | 2.22 | 2.14 |
+| 5120x5120 | 5120x5120 | 8 | 0.99 | 1.18 | 1.90 | 1.60 |
+| 4096x4096 | 4096x4096 | 8 | 1.01 | 1.14 | 2.05 | 1.86 |
+| 3072x3072 | 3072x3072 | 4 | 1.02 | 1.23 | 2.23 | 1.93 |
+| 2048x2048 | 2048x2048 | 8 | 1.15 | 1.43 | 2.07 | 1.71 |
+| 2048x2048 | 2048x2048 | 4 | 1.01 | 1.34 | 2.31 | 1.82 |
+
+From `K = 2880` on, the peer-write runs at the GEMM's speed for fused QKV and
+narrow K/V projections alike (the 6144x4096 kernel is faster than the cuBLAS
+kernel `torch.mm` selects for that shape). At `K = 2048` it is limited by the
+peer-write bandwidth, as the square 2048 / U = 8 case is: the 8192x2048
+projection writes four times the bytes of the square 2048 projection, while
+its GEMM takes only 3.7 times as long. The pulls with `N` from 2048 to 5120
+take 1.14-1.30x the GEMM, the 2048x8192 pull less than the square 2048 pull.
+A pull with a narrow input (`K = 1024` at U = 8, 128-column shards, for
+example the data gradient of a grouped-query K/V projection) adds 0.12 ms,
+about what the square 2048 pulls add, to a GEMM of only 0.36 ms; 32-row pull
+tickets did not shorten it.
+
 ### End to end
 
 In an end-to-end study with the diffusers implementations of Wan2.2-A14B and
@@ -479,10 +591,12 @@ slowest GPU.
 
 ## Limitations
 
-- Square projections only (`W` is `[hidden, hidden]`): grouped-query K/V
-  projections, fused QKV projections and cross-attention K/V from another
-  width are not supported yet. The per-subtile routing generalizes to them;
-  the host APIs and the arena layout do not.
+- Widths: the exchanged width follows the shape rule above, and the pull
+  output width must be a multiple of 256 (a 2880-wide output projection is not
+  supported; a 2880-wide peer-write input is).
+- A pull with a narrow input pays a roughly fixed cost on a short GEMM: at
+  `K = 512` (4096x512, U = 4) the kernel took 1.56x the GEMM and the API was no
+  faster than the PyTorch pipeline.
 - BF16 only; no FP8.
 - One node: U in {2, 4, 8} over NVLink.
 - Forward-only host APIs; no autograd integration.
@@ -495,7 +609,7 @@ slowest GPU.
 ```text
 mega_up/
   kernels/
-    peer_write_gemm.py       peer-write GEMM (QuACK-derived SM100 GEMM, Apache-2.0)
+    peer_write_gemm.py       peer-write GEMM (QuACK-derived, Apache-2.0)
     headshard_pull_gemm.py   head-shard pull GEMM
   ops.py                     BSHD / SBHD / THD host APIs
   runtime.py                 symmetric arena, barriers, shape rule

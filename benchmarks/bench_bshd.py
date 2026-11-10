@@ -47,7 +47,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--sequence", type=int, default=2048)
-    parser.add_argument("--heads", type=int, default=32)
+    parser.add_argument(
+        "--heads",
+        type=int,
+        default=32,
+        help="peer-write input heads; the peer-write weight is [N, heads*D]",
+    )
+    parser.add_argument(
+        "--peer-out-heads",
+        type=int,
+        default=0,
+        help="peer-write output heads, split across ranks (default: --heads)",
+    )
+    parser.add_argument(
+        "--pull-in-heads",
+        type=int,
+        default=0,
+        help="pull input heads, split across ranks (default: --peer-out-heads)",
+    )
+    parser.add_argument(
+        "--pull-out-heads",
+        type=int,
+        default=0,
+        help="pull output heads (default: --heads)",
+    )
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument(
         "--thd-samples",
@@ -219,11 +242,12 @@ class PeerWriteBaseline:
         batch, sequence, heads, head_dim = map(int, x.shape)
         self.batch = batch
         self.sequence = sequence
-        self.heads = heads
+        self.in_features = heads * head_dim
+        self.out_features = int(weight.shape[0])
         self.head_dim = head_dim
-        self.shard_heads = heads // up
+        self.shard_heads = self.out_features // (up * head_dim)
         self.dense = torch.empty(
-            (batch, sequence, heads, head_dim),
+            (batch, sequence, self.out_features),
             dtype=x.dtype,
             device=x.device,
         )
@@ -245,12 +269,11 @@ class PeerWriteBaseline:
         )
 
     def __call__(self) -> torch.Tensor:
-        hidden = self.heads * self.head_dim
         linear_into(
-            self.x.view(-1, hidden),
+            self.x.view(-1, self.in_features),
             self.weight,
             self.bias,
-            self.dense.view(-1, hidden),
+            self.dense.view(-1, self.out_features),
         )
         self.send.copy_(
             self.dense.view(
@@ -302,7 +325,8 @@ class PullGemmBaseline:
         self.sequence = global_sequence // up
         self.shard_heads = shard_heads
         self.head_dim = head_dim
-        self.heads = shard_heads * up
+        self.in_features = shard_heads * up * head_dim
+        self.out_features = int(weight.shape[0])
         exchange_shape = (
             up,
             batch,
@@ -315,11 +339,15 @@ class PullGemmBaseline:
         )
         self.received = torch.empty_like(self.send)
         self.materialized = torch.empty(
-            (batch, self.sequence, self.heads, head_dim),
+            (batch, self.sequence, up, shard_heads, head_dim),
             dtype=head_x.dtype,
             device=head_x.device,
         )
-        self.output = torch.empty_like(self.materialized)
+        self.output = torch.empty(
+            (batch, self.sequence, self.out_features // head_dim, head_dim),
+            dtype=head_x.dtype,
+            device=head_x.device,
+        )
 
     def __call__(self) -> torch.Tensor:
         self.send.copy_(
@@ -336,21 +364,12 @@ class PullGemmBaseline:
             self.send,
             group=self.group,
         )
-        self.materialized.view(
-            self.batch,
-            self.sequence,
-            self.up,
-            self.shard_heads,
-            self.head_dim,
-        ).copy_(
-            self.received.permute(1, 2, 0, 3, 4)
-        )
-        hidden = self.heads * self.head_dim
+        self.materialized.copy_(self.received.permute(1, 2, 0, 3, 4))
         linear_into(
-            self.materialized.view(-1, hidden),
+            self.materialized.view(-1, self.in_features),
             self.weight,
             self.bias,
-            self.output.view(-1, hidden),
+            self.output.view(-1, self.out_features),
         )
         return self.output
 
@@ -375,30 +394,31 @@ class PeerWriteBaselineTHD:
         tokens, heads, head_dim = map(int, x.shape)
         up = layout.up
         self.tokens = tokens
-        self.hidden = heads * head_dim
-        self.shard_hidden = self.hidden // up
+        self.in_features = heads * head_dim
+        out_features = int(weight.shape[0])
+        self.shard_width = out_features // up
         self.dense = torch.empty(
-            (tokens, self.hidden), dtype=x.dtype, device=x.device
+            (tokens, out_features), dtype=x.dtype, device=x.device
         )
         self.send = torch.empty(
-            (up, tokens, self.shard_hidden), dtype=x.dtype, device=x.device
+            (up, tokens, self.shard_width), dtype=x.dtype, device=x.device
         )
         self.received = torch.empty_like(self.send)
         self.output = torch.empty(
-            (up * tokens, heads // up, head_dim),
+            (up * tokens, self.shard_width // head_dim, head_dim),
             dtype=x.dtype,
             device=x.device,
         )
 
     def __call__(self) -> torch.Tensor:
         linear_into(
-            self.x.view(self.tokens, self.hidden),
+            self.x.view(self.tokens, self.in_features),
             self.weight,
             self.bias,
             self.dense,
         )
         self.send.copy_(
-            self.dense.view(self.tokens, self.layout.up, self.shard_hidden)
+            self.dense.view(self.tokens, self.layout.up, self.shard_width)
             .permute(1, 0, 2)
         )
         dist.all_to_all_single(
@@ -407,10 +427,10 @@ class PeerWriteBaselineTHD:
             group=self.group,
         )
         torch.index_select(
-            self.received.view(-1, self.shard_hidden),
+            self.received.view(-1, self.shard_width),
             0,
             self.layout.to_thd_index,
-            out=self.output.view(-1, self.shard_hidden),
+            out=self.output.view(-1, self.shard_width),
         )
         return self.output
 
@@ -435,38 +455,43 @@ class PullGemmBaselineTHD:
         total, shard_heads, head_dim = map(int, head_x.shape)
         up = layout.up
         self.tokens = total // up
-        self.heads = shard_heads * up
         self.head_dim = head_dim
-        self.shard_hidden = shard_heads * head_dim
-        self.hidden = self.heads * head_dim
+        self.shard_width = shard_heads * head_dim
+        self.in_features = up * self.shard_width
         self.send = torch.empty(
-            (up, self.tokens, self.shard_hidden),
+            (up, self.tokens, self.shard_width),
             dtype=head_x.dtype,
             device=head_x.device,
         )
         self.received = torch.empty_like(self.send)
         self.materialized = torch.empty(
-            (self.tokens, self.hidden), dtype=head_x.dtype, device=head_x.device
+            (self.tokens, self.in_features),
+            dtype=head_x.dtype,
+            device=head_x.device,
         )
-        self.output = torch.empty_like(self.materialized)
+        self.output = torch.empty(
+            (self.tokens, int(weight.shape[0])),
+            dtype=head_x.dtype,
+            device=head_x.device,
+        )
 
     def __call__(self) -> torch.Tensor:
         torch.index_select(
-            self.head_x.view(-1, self.shard_hidden),
+            self.head_x.view(-1, self.shard_width),
             0,
             self.layout.to_source_major_index,
-            out=self.send.view(-1, self.shard_hidden),
+            out=self.send.view(-1, self.shard_width),
         )
         dist.all_to_all_single(
             self.received,
             self.send,
             group=self.group,
         )
-        self.materialized.view(self.tokens, self.layout.up, self.shard_hidden).copy_(
+        self.materialized.view(self.tokens, self.layout.up, self.shard_width).copy_(
             self.received.permute(1, 0, 2)
         )
         linear_into(self.materialized, self.weight, self.bias, self.output)
-        return self.output.view(self.tokens, self.heads, self.head_dim)
+        return self.output.view(self.tokens, -1, self.head_dim)
 
 
 def reference_peer_write_thd(
@@ -488,7 +513,7 @@ def reference_pull_gemm_thd(
     """Independent split (slice loop) + all_to_all + permute + GEMM."""
 
     send = reference_split_thd(
-        baseline.head_x.view(-1, baseline.shard_hidden),
+        baseline.head_x.view(-1, baseline.shard_width),
         cu_seqlens,
         up=baseline.layout.up,
     )
@@ -496,11 +521,11 @@ def reference_pull_gemm_thd(
     dist.all_to_all_single(received, send, group=baseline.group)
     materialized = (
         received.permute(1, 0, 2)
-        .reshape(baseline.tokens, baseline.hidden)
+        .reshape(baseline.tokens, baseline.in_features)
         .contiguous()
     )
     return torch.nn.functional.linear(materialized, baseline.weight, baseline.bias).view(
-        baseline.tokens, baseline.heads, baseline.head_dim
+        baseline.tokens, -1, baseline.head_dim
     )
 
 
@@ -638,8 +663,11 @@ def main() -> None:
         raise ValueError("BSHD dimensions and iters must be positive")
     if args.warmup < 0:
         raise ValueError("warmup must be non-negative")
-    if args.heads % args.up:
-        raise ValueError("heads must be divisible by UP")
+    peer_out_heads = args.peer_out_heads or args.heads
+    pull_in_heads = args.pull_in_heads or peer_out_heads
+    pull_out_heads = args.pull_out_heads or args.heads
+    if peer_out_heads % args.up or pull_in_heads % args.up:
+        raise ValueError("the exchanged head counts must be divisible by UP")
     if int(os.environ["WORLD_SIZE"]) != args.up:
         raise ValueError("WORLD_SIZE must equal --up")
     thd = args.layout in ("thd", "thd-split")
@@ -662,11 +690,17 @@ def main() -> None:
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
-    hidden = args.heads * args.head_dim
-    shard_heads = args.heads // args.up
+    head_dim = args.head_dim
+    peer_in, peer_out = args.heads * head_dim, peer_out_heads * head_dim
+    pull_in, pull_out = pull_in_heads * head_dim, pull_out_heads * head_dim
+    peer_shard_heads = peer_out_heads // args.up
+    pull_shard_heads = pull_in_heads // args.up
     runtime = initialize_runtime(
         dist.group.WORLD,
-        hidden=hidden,
+        hidden=max(
+            peer_out if args.op != "pull-gemm" else 0,
+            pull_in if args.op != "peer-write" else 0,
+        ),
         max_rows=rows,
         device=device,
     )
@@ -682,12 +716,12 @@ def main() -> None:
     if peer_enabled:
         torch.manual_seed(args.seed)
         peer_weight = torch.randn(
-            (hidden, hidden),
+            (peer_out, peer_in),
             dtype=torch.bfloat16,
             device=device,
         )
         if args.bias:
-            peer_bias = torch.randn(hidden, dtype=torch.bfloat16, device=device)
+            peer_bias = torch.randn(peer_out, dtype=torch.bfloat16, device=device)
         torch.manual_seed(args.seed + 100 + rank)
         if thd:
             x = torch.randn(
@@ -714,7 +748,7 @@ def main() -> None:
                     bias=peer_bias,
                 )
             peer_output = torch.empty(
-                (args.up * rows, shard_heads, args.head_dim),
+                (args.up * rows, peer_shard_heads, args.head_dim),
                 dtype=torch.bfloat16,
                 device=device,
             )
@@ -732,30 +766,35 @@ def main() -> None:
                 bias=peer_bias,
             )
             peer_output = torch.empty(
-                (args.batch, args.up * args.sequence, shard_heads, args.head_dim),
+                (
+                    args.batch,
+                    args.up * args.sequence,
+                    peer_shard_heads,
+                    args.head_dim,
+                ),
                 dtype=torch.bfloat16,
                 device=device,
             )
         peer_matmul = MatmulReference(
-            x.view(-1, hidden),
+            x.view(-1, peer_in),
             peer_weight,
-            peer_baseline.dense.view(-1, hidden),
+            peer_baseline.dense.view(-1, peer_out),
             peer_bias,
         )
 
     if pull_enabled:
         torch.manual_seed(args.seed + 1)
         pull_weight = torch.randn(
-            (hidden, hidden),
+            (pull_out, pull_in),
             dtype=torch.bfloat16,
             device=device,
         )
         if args.bias:
-            pull_bias = torch.randn(hidden, dtype=torch.bfloat16, device=device)
+            pull_bias = torch.randn(pull_out, dtype=torch.bfloat16, device=device)
         torch.manual_seed(args.seed + 200 + rank)
         if thd:
             head_x = torch.randn(
-                (args.up * rows, shard_heads, args.head_dim),
+                (args.up * rows, pull_shard_heads, args.head_dim),
                 dtype=torch.bfloat16,
                 device=device,
             )
@@ -770,7 +809,7 @@ def main() -> None:
                 )
             else:
                 pull_baseline = PullGemmBaseline(
-                    head_x.view(1, args.up * rows, shard_heads, args.head_dim),
+                    head_x.view(1, args.up * rows, pull_shard_heads, args.head_dim),
                     pull_weight,
                     up=args.up,
                     group=dist.group.WORLD,
@@ -778,7 +817,12 @@ def main() -> None:
                 )
         else:
             head_x = torch.randn(
-                (args.batch, args.up * args.sequence, shard_heads, args.head_dim),
+                (
+                    args.batch,
+                    args.up * args.sequence,
+                    pull_shard_heads,
+                    args.head_dim,
+                ),
                 dtype=torch.bfloat16,
                 device=device,
             )
@@ -790,9 +834,9 @@ def main() -> None:
                 bias=pull_bias,
             )
         pull_matmul = MatmulReference(
-            pull_baseline.materialized.view(-1, hidden),
+            pull_baseline.materialized.view(-1, pull_in),
             pull_weight,
-            pull_baseline.output.view(-1, hidden),
+            pull_baseline.output.view(-1, pull_out),
             pull_bias,
         )
 
@@ -804,7 +848,7 @@ def main() -> None:
             prepared_pull = prepare_headshard_pull_gemm_thd(
                 pull_weight,
                 runtime,
-                heads=args.heads,
+                heads=pull_in_heads,
                 head_dim=args.head_dim,
                 tokens=rows,
                 layout=layout,
@@ -817,7 +861,7 @@ def main() -> None:
                 runtime,
                 batch=args.batch,
                 sequence=args.sequence,
-                heads=args.heads,
+                heads=pull_in_heads,
                 head_dim=args.head_dim,
                 bias=pull_bias,
                 workspace_epochs=workspace_epochs,
@@ -829,12 +873,12 @@ def main() -> None:
         from mega_up.kernels.peer_write_gemm import prepare_peer_write
 
         peer_kernel_only = prepare_peer_write(
-            x.view(1, rows, hidden),
+            x.view(1, rows, peer_in),
             peer_weight.unsqueeze(0),
             None,
             tuple(
                 peer.unsqueeze(0)
-                for peer in runtime.remote_write_views(rows)
+                for peer in runtime.remote_write_views(rows, peer_out)
             ),
             bias=peer_bias,
             local_rank=runtime.local_rank,
@@ -940,12 +984,12 @@ def main() -> None:
             assert layout is not None
             runtime.stage_rows_indexed(
                 rows=rows,
-                source=head_x.view(-1, runtime.shard_hidden),
+                source=head_x.view(-1, pull_in // args.up),
                 index=layout.to_source_major_index,
             )
         elif thd:
             runtime.stage_head_parallel(
-                head_x.view(1, args.up * rows, shard_heads, args.head_dim)
+                head_x.view(1, args.up * rows, pull_shard_heads, args.head_dim)
             )
         else:
             runtime.stage_head_parallel(head_x)
@@ -999,9 +1043,12 @@ def main() -> None:
             "tokens_per_rank": rows,
             "heads": args.heads,
             "head_dim": args.head_dim,
-            "hidden": hidden,
             "up": args.up,
         }
+        if peer_enabled:
+            shape["peer_write_weight"] = [peer_out, peer_in]
+        if pull_enabled:
+            shape["pull_weight"] = [pull_out, pull_in]
         if split:
             shape["thd"] = {
                 "num_samples": len(lengths),

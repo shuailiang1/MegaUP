@@ -17,7 +17,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from .runtime import MegaUPRuntime, unsupported_shape_reason
+from .runtime import HIDDEN_MULTIPLE, MegaUPRuntime, unsupported_shape_reason
 
 
 def _source_major_to_bshd(
@@ -212,13 +212,11 @@ def prepare_thd_layout(
     for the default contiguous-slab THD contract.
     """
 
-    layout = _build_thd_layout(
+    return _build_thd_layout(
         cu_seqlens,
         up=runtime.up,
         device=runtime.device,
     )
-    runtime.check_rows(layout.tokens)
-    return layout
 
 
 def _source_major_to_thd(
@@ -275,19 +273,18 @@ def _check_runtime_device(runtime: MegaUPRuntime) -> None:
     capability = torch.cuda.get_device_capability(runtime.device)
     if capability[0] not in (10, 11):
         raise ValueError(
-            "Mega-UP kernels require SM100/SM110, got capability "
-            f"{capability}"
+            "Mega-UP kernels do not support this GPU (compute capability "
+            f"{capability})"
         )
-    reason = unsupported_shape_reason(runtime.hidden, runtime.up)
-    if reason is not None:
-        raise ValueError(reason)
 
 
-def _check_weight(weight: Tensor, runtime: MegaUPRuntime) -> None:
-    expected = (runtime.hidden, runtime.hidden)
-    if tuple(weight.shape) != expected:
+def _check_weight(weight: Tensor, runtime: MegaUPRuntime) -> tuple[int, int]:
+    """Validate an ``[out_features, in_features]`` weight; return ``(N, K)``."""
+
+    if not isinstance(weight, Tensor) or weight.ndim != 2 or min(weight.shape) <= 0:
         raise ValueError(
-            f"weight must have shape {expected}, got {tuple(weight.shape)}"
+            "weight must be a non-empty [out_features, in_features] tensor, "
+            f"got {_tensor_signature(weight)}"
         )
     if (
         weight.dtype != torch.bfloat16
@@ -297,14 +294,64 @@ def _check_weight(weight: Tensor, runtime: MegaUPRuntime) -> None:
         raise ValueError(
             "weight must be contiguous BF16 on the runtime device"
         )
+    return int(weight.shape[0]), int(weight.shape[1])
 
 
-def _check_bias(bias: Tensor | None, runtime: MegaUPRuntime) -> None:
+def _check_exchanged_width(width: int, runtime: MegaUPRuntime, name: str) -> None:
+    reason = unsupported_shape_reason(width, runtime.up)
+    if reason is not None:
+        raise ValueError(f"{name}: {reason}")
+
+
+def _check_peer_weight(
+    weight: Tensor, runtime: MegaUPRuntime, head_dim: int
+) -> tuple[int, int]:
+    """Validate a peer-write weight; return ``(N, K)``.
+
+    The output width ``N`` is exchanged: each rank receives ``N/UP`` columns,
+    which must hold whole ``head_dim``-wide heads.
+    """
+
+    out_features, in_features = _check_weight(weight, runtime)
+    _check_exchanged_width(out_features, runtime, "peer-write out_features")
+    if out_features % (runtime.up * head_dim):
+        raise ValueError(
+            f"out_features={out_features} must be a multiple of "
+            f"UP*head_dim={runtime.up * head_dim}"
+        )
+    # TMA loads need 16-byte (8 BF16) row strides.
+    if in_features % 8:
+        raise ValueError(f"in_features={in_features} must be a multiple of 8")
+    return out_features, in_features
+
+
+def _check_pull_weight(
+    weight: Tensor, runtime: MegaUPRuntime, head_dim: int
+) -> tuple[int, int]:
+    """Validate a pull weight; return ``(N, K)``.
+
+    The input width ``K`` is exchanged. The output width ``N`` is tiled with
+    256-wide tiles and returned as ``N/head_dim`` heads.
+    """
+
+    out_features, in_features = _check_weight(weight, runtime)
+    _check_exchanged_width(in_features, runtime, "pull in_features")
+    if out_features % HIDDEN_MULTIPLE or out_features % head_dim:
+        raise ValueError(
+            f"out_features={out_features} must be a multiple of "
+            f"{HIDDEN_MULTIPLE} and of head_dim={head_dim}"
+        )
+    return out_features, in_features
+
+
+def _check_bias(
+    bias: Tensor | None, runtime: MegaUPRuntime, out_features: int
+) -> None:
     if bias is None:
         return
-    if not isinstance(bias, Tensor) or tuple(bias.shape) != (runtime.hidden,):
+    if not isinstance(bias, Tensor) or tuple(bias.shape) != (out_features,):
         raise ValueError(
-            f"bias must have shape ({runtime.hidden},), got "
+            f"bias must have shape ({out_features},), got "
             f"{_tensor_signature(bias)}"
         )
     if (
@@ -332,7 +379,6 @@ def _check_layout(layout: THDLayout, runtime: MegaUPRuntime) -> None:
         raise ValueError(
             f"THD layout lives on {layout.device}, runtime on {runtime.device}"
         )
-    runtime.check_rows(layout.tokens)
 
 
 def _check_activation(tensor: Tensor, runtime: MegaUPRuntime, name: str) -> None:
@@ -361,9 +407,42 @@ def _check_out(
         )
 
 
+def _weight_widths(weight: object) -> dict[str, int]:
+    if not isinstance(weight, Tensor) or weight.ndim != 2:
+        raise ValueError(
+            "weight must be a 2-D [out_features, in_features] tensor, got "
+            f"{_tensor_signature(weight)}"
+        )
+    return {"out_features": int(weight.shape[0]), "in_features": int(weight.shape[1])}
+
+
+def _check_logical_shape(shape: tuple[int, ...]) -> None:
+    if min(shape) <= 0:
+        raise ValueError(f"all dimensions must be positive, got {shape}")
+
+
+def _check_input_heads(heads: int, head_dim: int, in_features: int) -> None:
+    if heads * head_dim != in_features:
+        raise ValueError(
+            f"heads*head_dim={heads}*{head_dim} must equal the weight's "
+            f"in_features={in_features}"
+        )
+
+
+def _check_pull_heads(
+    heads: int, head_dim: int, runtime: MegaUPRuntime, in_features: int
+) -> None:
+    if heads % runtime.up:
+        raise ValueError(f"heads={heads} must be divisible by UP={runtime.up}")
+    _check_input_heads(heads, head_dim, in_features)
+
+
 def _peer_shape(
     x: Tensor,
     runtime: MegaUPRuntime,
+    *,
+    in_features: int,
+    out_features: int,
 ) -> tuple[int, int, int, int]:
     if x.ndim != 4:
         raise ValueError(
@@ -372,16 +451,8 @@ def _peer_shape(
     batch, sequence, heads, head_dim = map(int, x.shape)
     if min(batch, sequence, heads, head_dim) <= 0:
         raise ValueError(f"all BSHD dimensions must be positive, got {x.shape}")
-    if heads % runtime.up:
-        raise ValueError(
-            f"heads={heads} must be divisible by UP={runtime.up}"
-        )
-    if heads * head_dim != runtime.hidden:
-        raise ValueError(
-            f"H*D must equal runtime.hidden={runtime.hidden}, got "
-            f"{heads}*{head_dim}"
-        )
-    runtime.check_rows(batch * sequence)
+    _check_input_heads(heads, head_dim, in_features)
+    runtime.check_capacity(batch * sequence, out_features)
     _check_activation(x, runtime, "input")
     return batch, sequence, heads, head_dim
 
@@ -390,6 +461,9 @@ def _peer_shape_thd(
     x: Tensor,
     runtime: MegaUPRuntime,
     layout: THDLayout | None,
+    *,
+    in_features: int,
+    out_features: int,
 ) -> tuple[int, int, int]:
     if x.ndim != 3:
         raise ValueError(
@@ -398,7 +472,6 @@ def _peer_shape_thd(
     tokens, heads, head_dim = map(int, x.shape)
     if min(tokens, heads, head_dim) <= 0:
         raise ValueError(f"all THD dimensions must be positive, got {x.shape}")
-    runtime.check_rows(tokens)
     if layout is not None:
         _check_layout(layout, runtime)
         if tokens != layout.tokens:
@@ -406,15 +479,8 @@ def _peer_shape_thd(
                 f"input has {tokens} rows but the THD layout describes "
                 f"{layout.tokens} local tokens"
             )
-    if heads % runtime.up:
-        raise ValueError(
-            f"heads={heads} must be divisible by UP={runtime.up}"
-        )
-    if heads * head_dim != runtime.hidden:
-        raise ValueError(
-            f"H*D must equal runtime.hidden={runtime.hidden}, got "
-            f"{heads}*{head_dim}"
-        )
+    _check_input_heads(heads, head_dim, in_features)
+    runtime.check_capacity(tokens, out_features)
     _check_activation(x, runtime, "input")
     return tokens, heads, head_dim
 
@@ -422,6 +488,8 @@ def _peer_shape_thd(
 def _pull_shape(
     head_x: Tensor,
     runtime: MegaUPRuntime,
+    *,
+    in_features: int,
 ) -> tuple[int, int, int, int]:
     if head_x.ndim != 4:
         raise ValueError(
@@ -440,11 +508,8 @@ def _pull_shape(
         )
     sequence = global_sequence // runtime.up
     heads = shard_heads * runtime.up
-    if heads * head_dim != runtime.hidden:
-        raise ValueError(
-            f"UP*(H/UP)*D must equal runtime.hidden={runtime.hidden}"
-        )
-    runtime.check_rows(batch * sequence)
+    _check_input_heads(heads, head_dim, in_features)
+    runtime.check_capacity(batch * sequence, in_features)
     _check_activation(head_x, runtime, "head-parallel input")
     return batch, sequence, heads, head_dim
 
@@ -453,6 +518,8 @@ def _pull_shape_thd(
     head_x: Tensor,
     runtime: MegaUPRuntime,
     layout: THDLayout | None,
+    *,
+    in_features: int,
 ) -> tuple[int, int, int]:
     """Return ``(tokens, heads, head_dim)`` for packed ``[UP*T,H/UP,D]``."""
 
@@ -471,7 +538,6 @@ def _pull_shape_thd(
             f"pull THD input rows {total} must be divisible by UP={runtime.up}"
         )
     tokens = total // runtime.up
-    runtime.check_rows(tokens)
     if layout is not None:
         _check_layout(layout, runtime)
         if tokens != layout.tokens:
@@ -480,10 +546,8 @@ def _pull_shape_thd(
                 f"rows, got {total}"
             )
     heads = shard_heads * runtime.up
-    if heads * head_dim != runtime.hidden:
-        raise ValueError(
-            f"UP*(H/UP)*D must equal runtime.hidden={runtime.hidden}"
-        )
+    _check_input_heads(heads, head_dim, in_features)
+    runtime.check_capacity(tokens, in_features)
     _check_activation(head_x, runtime, "head-parallel input")
     return tokens, heads, head_dim
 
@@ -491,6 +555,9 @@ def _pull_shape_thd(
 def _peer_shape_sbhd(
     x: Tensor,
     runtime: MegaUPRuntime,
+    *,
+    in_features: int,
+    out_features: int,
 ) -> tuple[int, int, int, int]:
     """Return ``(sequence, batch, heads, head_dim)`` for ``[S,B,H,D]``."""
 
@@ -501,16 +568,8 @@ def _peer_shape_sbhd(
     sequence, batch, heads, head_dim = map(int, x.shape)
     if min(sequence, batch, heads, head_dim) <= 0:
         raise ValueError(f"all SBHD dimensions must be positive, got {x.shape}")
-    if heads % runtime.up:
-        raise ValueError(
-            f"heads={heads} must be divisible by UP={runtime.up}"
-        )
-    if heads * head_dim != runtime.hidden:
-        raise ValueError(
-            f"H*D must equal runtime.hidden={runtime.hidden}, got "
-            f"{heads}*{head_dim}"
-        )
-    runtime.check_rows(sequence * batch)
+    _check_input_heads(heads, head_dim, in_features)
+    runtime.check_capacity(sequence * batch, out_features)
     _check_activation(x, runtime, "input")
     return sequence, batch, heads, head_dim
 
@@ -518,6 +577,8 @@ def _peer_shape_sbhd(
 def _pull_shape_sbhd(
     head_x: Tensor,
     runtime: MegaUPRuntime,
+    *,
+    in_features: int,
 ) -> tuple[int, int, int, int]:
     """Return ``(sequence, batch, heads, head_dim)`` for ``[UP*S,B,H/UP,D]``."""
 
@@ -538,11 +599,8 @@ def _pull_shape_sbhd(
         )
     sequence = global_sequence // runtime.up
     heads = shard_heads * runtime.up
-    if heads * head_dim != runtime.hidden:
-        raise ValueError(
-            f"UP*(H/UP)*D must equal runtime.hidden={runtime.hidden}"
-        )
-    runtime.check_rows(sequence * batch)
+    _check_input_heads(heads, head_dim, in_features)
+    runtime.check_capacity(sequence * batch, in_features)
     _check_activation(head_x, runtime, "head-parallel input")
     return sequence, batch, heads, head_dim
 
@@ -597,26 +655,23 @@ def _collective_validate(
         )
 
 
+class _ProjectionWidths:
+    """``in_features`` and ``out_features`` of a prepared executable's weight."""
+
+    weight: Tensor
+
+    @property
+    def in_features(self) -> int:
+        return int(self.weight.shape[1])
+
+    @property
+    def out_features(self) -> int:
+        return int(self.weight.shape[0])
+
+
 # ---------------------------------------------------------------------------
 # Peer-write GEMM
 # ---------------------------------------------------------------------------
-
-
-def _check_logical_shape(
-    shape: tuple[int, ...],
-    heads: int,
-    head_dim: int,
-    runtime: MegaUPRuntime,
-) -> None:
-    if min(shape) <= 0:
-        raise ValueError(f"all dimensions must be positive, got {shape}")
-    if heads % runtime.up:
-        raise ValueError(f"heads={heads} must be divisible by UP={runtime.up}")
-    if heads * head_dim != runtime.hidden:
-        raise ValueError(
-            f"H*D must equal runtime.hidden={runtime.hidden}, got "
-            f"{heads}*{head_dim}"
-        )
 
 
 def _bind_peer_write(
@@ -637,11 +692,15 @@ def _bind_peer_write(
     try:
         from .kernels.peer_write_gemm import make_peer_write_launch
 
+        out_features, in_features = int(weight.shape[0]), int(weight.shape[1])
         launch = make_peer_write_launch(
             weight.unsqueeze(0),
             None,
-            tuple(peer.unsqueeze(0) for peer in runtime.remote_write_views(rows)),
-            a_shape=(1, rows, runtime.hidden),
+            tuple(
+                peer.unsqueeze(0)
+                for peer in runtime.remote_write_views(rows, out_features)
+            ),
+            a_shape=(1, rows, in_features),
             bias=bias,
             local_rank=runtime.local_rank,
         )
@@ -663,12 +722,12 @@ def _run_prepared_peer_write(
     materialize: Callable[[], object],
 ) -> None:
     with torch.no_grad(), runtime.lease():
-        launch(x.view(1, rows, runtime.hidden))
+        launch(x.view(1, rows, -1))
         materialize()
 
 
 @dataclass
-class PreparedPeerWriteGemm:
+class PreparedPeerWriteGemm(_ProjectionWidths):
     """Reusable peer-write executable for a fixed ``[B,S,H,D]`` input shape."""
 
     runtime: MegaUPRuntime
@@ -685,7 +744,7 @@ class PreparedPeerWriteGemm:
         return (
             self.batch,
             self.runtime.up * self.sequence,
-            self.heads // self.runtime.up,
+            self.out_features // (self.runtime.up * self.head_dim),
             self.head_dim,
         )
 
@@ -700,7 +759,12 @@ class PreparedPeerWriteGemm:
         shape: tuple[int, int, int, int] | None = None
         local_error: str | None = None
         try:
-            shape = _peer_shape(x, self.runtime)
+            shape = _peer_shape(
+                x,
+                self.runtime,
+                in_features=self.in_features,
+                out_features=self.out_features,
+            )
             if shape != expected:
                 raise ValueError(
                     f"prepared peer-write GEMM expects BSHD {expected}, got {shape}"
@@ -737,7 +801,7 @@ class PreparedPeerWriteGemm:
             lambda: self.runtime.copy_peer_written(
                 batch=self.batch,
                 sequence=self.sequence,
-                shard_heads=self.heads // self.runtime.up,
+                shard_heads=self.output_shape[2],
                 head_dim=self.head_dim,
                 out=out,
             ),
@@ -746,7 +810,7 @@ class PreparedPeerWriteGemm:
 
 
 @dataclass
-class PreparedPeerWriteGemmSBHD:
+class PreparedPeerWriteGemmSBHD(_ProjectionWidths):
     """Reusable peer-write executable for a fixed sequence-first ``[S,B,H,D]``
     input shape."""
 
@@ -764,7 +828,7 @@ class PreparedPeerWriteGemmSBHD:
         return (
             self.runtime.up * self.sequence,
             self.batch,
-            self.heads // self.runtime.up,
+            self.out_features // (self.runtime.up * self.head_dim),
             self.head_dim,
         )
 
@@ -779,7 +843,12 @@ class PreparedPeerWriteGemmSBHD:
         shape: tuple[int, int, int, int] | None = None
         local_error: str | None = None
         try:
-            shape = _peer_shape_sbhd(x, self.runtime)
+            shape = _peer_shape_sbhd(
+                x,
+                self.runtime,
+                in_features=self.in_features,
+                out_features=self.out_features,
+            )
             if shape != expected:
                 raise ValueError(
                     f"prepared SBHD peer-write GEMM expects (S,B,H,D) {expected}, "
@@ -811,7 +880,7 @@ class PreparedPeerWriteGemmSBHD:
             )
         up = self.runtime.up
         rows = self.sequence * self.batch
-        shard_heads = self.heads // up
+        shard_heads = self.output_shape[2]
         # Rows are sequence-major, so the receive slots already hold
         # [UP*S,B,H/UP,D] and the materialization is one contiguous copy.
         _run_prepared_peer_write(
@@ -831,7 +900,7 @@ class PreparedPeerWriteGemmSBHD:
 
 
 @dataclass
-class PreparedPeerWriteGemmTHD:
+class PreparedPeerWriteGemmTHD(_ProjectionWidths):
     """Reusable packed-THD peer-write executable for a fixed token count.
 
     ``layout`` is ``None`` for the contiguous-slab contract (output rows in
@@ -852,7 +921,7 @@ class PreparedPeerWriteGemmTHD:
     def output_shape(self) -> tuple[int, int, int]:
         return (
             self.runtime.up * self.tokens,
-            self.heads // self.runtime.up,
+            self.out_features // (self.runtime.up * self.head_dim),
             self.head_dim,
         )
 
@@ -867,7 +936,13 @@ class PreparedPeerWriteGemmTHD:
         shape: tuple[int, int, int] | None = None
         local_error: str | None = None
         try:
-            shape = _peer_shape_thd(x, self.runtime, self.layout)
+            shape = _peer_shape_thd(
+                x,
+                self.runtime,
+                self.layout,
+                in_features=self.in_features,
+                out_features=self.out_features,
+            )
             if shape != expected:
                 raise ValueError(
                     f"prepared THD peer-write GEMM expects (T,H,D) {expected}, "
@@ -899,7 +974,7 @@ class PreparedPeerWriteGemmTHD:
                 self.output_shape, dtype=torch.bfloat16, device=self.runtime.device
             )
         up = self.runtime.up
-        shard_heads = self.heads // up
+        shard_heads = self.output_shape[1]
         layout = self.layout
 
         def materialize() -> None:
@@ -935,21 +1010,24 @@ def prepare_peer_write_gemm_bshd(
     validate_group: bool = True,
 ) -> PreparedPeerWriteGemm:
     """Prepare a reusable ``linear(weight, bias) + all-to-all`` replacement:
-    ``[B,S,H,D]`` to ``[B,UP*S,H/UP,D]``.
+    ``[B,S,H,D]`` to ``[B,UP*S,N/(UP*D),D]``.
 
-    The weight, bias, arena slots and tile schedule are validated and bound
-    once; a call checks the input, launches the kernel and copies the received
-    rows into the output.
+    ``weight`` is ``[N, K]`` with ``K = heads * head_dim``; the output keeps
+    ``head_dim`` and splits its ``N/head_dim`` heads across the ranks. The
+    weight, bias, arena slots and tile schedule are validated and bound once;
+    a call checks the input, launches the kernel and copies the received rows
+    into the output.
     """
 
     logical_shape = (batch, sequence, heads, head_dim)
     local_error: str | None = None
     try:
         _check_runtime_device(runtime)
-        _check_weight(weight, runtime)
-        _check_bias(bias, runtime)
-        _check_logical_shape(logical_shape, heads, head_dim, runtime)
-        runtime.check_rows(batch * sequence)
+        _check_logical_shape(logical_shape)
+        out_features, in_features = _check_peer_weight(weight, runtime, head_dim)
+        _check_bias(bias, runtime, out_features)
+        _check_input_heads(heads, head_dim, in_features)
+        runtime.check_capacity(batch * sequence, out_features)
     except Exception as error:
         local_error = f"{type(error).__name__}: {error}"
     metadata = (logical_shape, _tensor_signature(weight), _optional_signature(bias))
@@ -995,16 +1073,18 @@ def prepare_peer_write_gemm_sbhd(
     validate_group: bool = True,
 ) -> PreparedPeerWriteGemmSBHD:
     """Prepare a reusable sequence-first ``linear(weight, bias) + all-to-all``
-    replacement: ``[S,B,H,D]`` to ``[UP*S,B,H/UP,D]``."""
+    replacement: ``[S,B,H,D]`` to ``[UP*S,B,N/(UP*D),D]`` for an ``[N, K]``
+    weight with ``K = heads * head_dim``."""
 
     logical_shape = (sequence, batch, heads, head_dim)
     local_error: str | None = None
     try:
         _check_runtime_device(runtime)
-        _check_weight(weight, runtime)
-        _check_bias(bias, runtime)
-        _check_logical_shape(logical_shape, heads, head_dim, runtime)
-        runtime.check_rows(sequence * batch)
+        _check_logical_shape(logical_shape)
+        out_features, in_features = _check_peer_weight(weight, runtime, head_dim)
+        _check_bias(bias, runtime, out_features)
+        _check_input_heads(heads, head_dim, in_features)
+        runtime.check_capacity(sequence * batch, out_features)
     except Exception as error:
         local_error = f"{type(error).__name__}: {error}"
     metadata = (logical_shape, _tensor_signature(weight), _optional_signature(bias))
@@ -1050,7 +1130,8 @@ def prepare_peer_write_gemm_thd(
     validate_group: bool = True,
 ) -> PreparedPeerWriteGemmTHD:
     """Prepare a reusable packed-THD ``linear(weight, bias) + all-to-all``
-    replacement: ``[T,H,D]`` to ``[UP*T,H/UP,D]``.
+    replacement: ``[T,H,D]`` to ``[UP*T,N/(UP*D),D]`` for an ``[N, K]``
+    weight with ``K = heads * head_dim``.
 
     ``tokens`` may be omitted when ``layout`` is given. The output order is
     the one described in :func:`peer_write_gemm_thd`.
@@ -1061,8 +1142,9 @@ def prepare_peer_write_gemm_thd(
     logical_shape: tuple[int, int, int] | None = None
     try:
         _check_runtime_device(runtime)
-        _check_weight(weight, runtime)
-        _check_bias(bias, runtime)
+        _check_logical_shape((heads, head_dim))
+        out_features, in_features = _check_peer_weight(weight, runtime, head_dim)
+        _check_bias(bias, runtime, out_features)
         if layout is not None:
             _check_layout(layout, runtime)
             if tokens is None:
@@ -1074,8 +1156,9 @@ def prepare_peer_write_gemm_thd(
         if tokens is None:
             raise ValueError("tokens is required when no THD layout is given")
         logical_shape = (tokens, heads, head_dim)
-        _check_logical_shape(logical_shape, heads, head_dim, runtime)
-        runtime.check_rows(tokens)
+        _check_logical_shape(logical_shape)
+        _check_input_heads(heads, head_dim, in_features)
+        runtime.check_capacity(tokens, out_features)
     except Exception as error:
         local_error = f"{type(error).__name__}: {error}"
     metadata = (
@@ -1127,16 +1210,16 @@ def peer_write_gemm_bshd(
     """Fuse ``linear([B,S,H,D], weight, bias)`` with the Ulysses head all-to-all.
 
     ``weight`` and the optional ``bias`` follow ``torch.nn.functional.linear``
-    layout: ``[out_features,in_features]`` and ``[out_features]``. The
-    returned tensor has shape ``[B,UP*S,H/UP,D]`` and owns ordinary CUDA
-    storage. Repeated calls with one shape should use
-    :func:`prepare_peer_write_gemm_bshd`, which validates and binds once.
+    layout: ``[N, K]`` and ``[N]``, with ``K = H*D``. The returned tensor has
+    shape ``[B,UP*S,N/(UP*D),D]`` and owns ordinary CUDA storage. Repeated
+    calls with one shape should use :func:`prepare_peer_write_gemm_bshd`,
+    which validates and binds once.
     """
 
     shape: tuple[int, int, int, int] | None = None
     local_error: str | None = None
     try:
-        shape = _peer_shape(x, runtime)
+        shape = _peer_shape(x, runtime, **_weight_widths(weight))
     except Exception as error:
         local_error = f"{type(error).__name__}: {error}"
     if validate_group:
@@ -1184,20 +1267,21 @@ def peer_write_gemm_thd(
     """Fuse ``linear([T,H,D], weight, bias)`` with the Ulysses head all-to-all
     for packed data.
 
-    ``x`` holds this rank's ``T`` rows of the packed token stream. The
-    returned tensor has shape ``[UP*T,H/UP,D]``. Without ``layout`` the rows
-    are in source-rank order: when every rank holds a contiguous slab of the
-    global stream this is the global packed order, so global ``cu_seqlens``
-    apply unchanged and the materialization is one contiguous copy. With a
-    ``layout`` (samples split evenly across ranks), every sample is regrouped
-    to be contiguous with boundaries ``layout.cu_seqlens_out``. Repeated
-    calls with one shape should use :func:`prepare_peer_write_gemm_thd`.
+    ``x`` holds this rank's ``T`` rows of the packed token stream and
+    ``weight`` is ``[N, H*D]``. The returned tensor has shape
+    ``[UP*T,N/(UP*D),D]``. Without ``layout`` the rows are in source-rank
+    order: when every rank holds a contiguous slab of the global stream this
+    is the global packed order, so global ``cu_seqlens`` apply unchanged and
+    the materialization is one contiguous copy. With a ``layout`` (samples
+    split evenly across ranks), every sample is regrouped to be contiguous
+    with boundaries ``layout.cu_seqlens_out``. Repeated calls with one shape
+    should use :func:`prepare_peer_write_gemm_thd`.
     """
 
     shape: tuple[int, int, int] | None = None
     local_error: str | None = None
     try:
-        shape = _peer_shape_thd(x, runtime, layout)
+        shape = _peer_shape_thd(x, runtime, layout, **_weight_widths(weight))
     except Exception as error:
         local_error = f"{type(error).__name__}: {error}"
     if validate_group:
@@ -1245,17 +1329,18 @@ def peer_write_gemm_sbhd(
     """Fuse ``linear([S,B,H,D], weight, bias)`` with the Ulysses head all-to-all
     for sequence-first data.
 
-    ``x`` holds this rank's ``S`` sequence positions. The returned tensor has
-    shape ``[UP*S,B,H/UP,D]``: the ``UP`` sequence chunks in rank order. Rows
-    are sequence-major, so the receive slots already have this layout and the
-    materialization is one contiguous copy for every ``B``. Repeated calls
-    with one shape should use :func:`prepare_peer_write_gemm_sbhd`.
+    ``x`` holds this rank's ``S`` sequence positions and ``weight`` is
+    ``[N, H*D]``. The returned tensor has shape ``[UP*S,B,N/(UP*D),D]``: the
+    ``UP`` sequence chunks in rank order. Rows are sequence-major, so the
+    receive slots already have this layout and the materialization is one
+    contiguous copy for every ``B``. Repeated calls with one shape should use
+    :func:`prepare_peer_write_gemm_sbhd`.
     """
 
     shape: tuple[int, int, int, int] | None = None
     local_error: str | None = None
     try:
-        shape = _peer_shape_sbhd(x, runtime)
+        shape = _peer_shape_sbhd(x, runtime, **_weight_widths(weight))
     except Exception as error:
         local_error = f"{type(error).__name__}: {error}"
     if validate_group:
@@ -1314,11 +1399,15 @@ def _compile_pull(
     setup_error: str | None = None
     try:
         materialized_input = torch.empty(
-            (rows, runtime.hidden),
+            (rows, int(weight.shape[1])),
             dtype=torch.bfloat16,
             device=runtime.device,
         )
-        output_2d = torch.empty_like(materialized_input)
+        output_2d = torch.empty(
+            (rows, int(weight.shape[0])),
+            dtype=torch.bfloat16,
+            device=runtime.device,
+        )
         from .kernels.headshard_pull_gemm import (
             compile_headshard_pull_gemm,
         )
@@ -1331,7 +1420,6 @@ def _compile_pull(
             logical_m=rows,
             rank=runtime.local_rank,
             up=runtime.up,
-            hidden=runtime.hidden,
             bias=bias,
             workspace_epochs=workspace_epochs,
             peer_rows=rows,
@@ -1370,7 +1458,7 @@ def _run_prepared_pull(
 
 
 @dataclass
-class PreparedHeadShardPullGemm:
+class PreparedHeadShardPullGemm(_ProjectionWidths):
     """Reusable pull-GEMM executable with stable input/output buffers."""
 
     runtime: MegaUPRuntime
@@ -1398,7 +1486,7 @@ class PreparedHeadShardPullGemm:
         return self.output_2d.view(
             self.batch,
             self.sequence,
-            self.heads,
+            self.out_features // self.head_dim,
             self.head_dim,
         )
 
@@ -1417,7 +1505,7 @@ class PreparedHeadShardPullGemm:
         shape: tuple[int, int, int, int] | None = None
         local_error: str | None = None
         try:
-            shape = _pull_shape(head_x, self.runtime)
+            shape = _pull_shape(head_x, self.runtime, in_features=self.in_features)
             if shape != expected:
                 raise ValueError(
                     "prepared pull-GEMM expects logical BSHD "
@@ -1452,7 +1540,7 @@ class PreparedHeadShardPullGemm:
 
 
 @dataclass
-class PreparedHeadShardPullGemmSBHD:
+class PreparedHeadShardPullGemmSBHD(_ProjectionWidths):
     """Reusable sequence-first pull-GEMM executable with stable buffers."""
 
     runtime: MegaUPRuntime
@@ -1480,7 +1568,7 @@ class PreparedHeadShardPullGemmSBHD:
         return self.output_2d.view(
             self.sequence,
             self.batch,
-            self.heads,
+            self.out_features // self.head_dim,
             self.head_dim,
         )
 
@@ -1494,7 +1582,9 @@ class PreparedHeadShardPullGemmSBHD:
         shape: tuple[int, int, int, int] | None = None
         local_error: str | None = None
         try:
-            shape = _pull_shape_sbhd(head_x, self.runtime)
+            shape = _pull_shape_sbhd(
+                head_x, self.runtime, in_features=self.in_features
+            )
             if shape != expected:
                 raise ValueError(
                     "prepared SBHD pull-GEMM expects logical (S,B,H,D) "
@@ -1535,7 +1625,7 @@ class PreparedHeadShardPullGemmSBHD:
 
 
 @dataclass
-class PreparedHeadShardPullGemmTHD:
+class PreparedHeadShardPullGemmTHD(_ProjectionWidths):
     """Reusable packed-THD pull-GEMM executable for a fixed token count.
 
     ``layout`` is ``None`` for the contiguous-slab contract (input rows in
@@ -1563,7 +1653,9 @@ class PreparedHeadShardPullGemmTHD:
 
     @property
     def output(self) -> Tensor:
-        return self.output_2d.view(self.tokens, self.heads, self.head_dim)
+        return self.output_2d.view(
+            self.tokens, self.out_features // self.head_dim, self.head_dim
+        )
 
     def __call__(
         self,
@@ -1575,7 +1667,9 @@ class PreparedHeadShardPullGemmTHD:
         shape: tuple[int, int, int] | None = None
         local_error: str | None = None
         try:
-            shape = _pull_shape_thd(head_x, self.runtime, self.layout)
+            shape = _pull_shape_thd(
+                head_x, self.runtime, self.layout, in_features=self.in_features
+            )
             if shape != expected:
                 raise ValueError(
                     "prepared THD pull-GEMM expects logical (T,H,D) "
@@ -1613,7 +1707,7 @@ class PreparedHeadShardPullGemmTHD:
             else:
                 self.runtime.stage_rows_indexed(
                     rows=self.tokens,
-                    source=head_x.view(up * self.tokens, self.runtime.shard_hidden),
+                    source=head_x.view(up * self.tokens, self.in_features // up),
                     index=layout.to_source_major_index,
                 )
 
@@ -1633,33 +1727,23 @@ def prepare_headshard_pull_gemm_bshd(
     workspace_epochs: int = 4096,
     validate_group: bool = True,
 ) -> PreparedHeadShardPullGemm:
-    """Prepare a reusable ``all-to-all + linear(weight, bias)`` replacement.
+    """Prepare a reusable ``all-to-all + linear(weight, bias)`` replacement:
+    ``[B,UP*S,H/UP,D]`` to ``[B,S,N/D,D]``.
 
-    The returned output aliases a reusable buffer and is overwritten by the
-    next call. Call ``clone()`` when the result must outlive a subsequent call.
+    ``weight`` is ``[N, K]`` with ``K = heads * head_dim``. The returned
+    output aliases a reusable buffer and is overwritten by the next call.
+    Call ``clone()`` when the result must outlive a subsequent call.
     """
 
     logical_shape = (batch, sequence, heads, head_dim)
     local_error: str | None = None
     try:
         _check_runtime_device(runtime)
-        _check_weight(weight, runtime)
-        _check_bias(bias, runtime)
-        if min(logical_shape) <= 0:
-            raise ValueError(
-                "all BSHD dimensions must be positive, "
-                f"got {logical_shape}"
-            )
-        if heads % runtime.up:
-            raise ValueError(
-                f"heads={heads} must be divisible by UP={runtime.up}"
-            )
-        if heads * head_dim != runtime.hidden:
-            raise ValueError(
-                f"H*D must equal runtime.hidden={runtime.hidden}, got "
-                f"{heads}*{head_dim}"
-            )
-        runtime.check_rows(batch * sequence)
+        _check_logical_shape(logical_shape)
+        out_features, in_features = _check_pull_weight(weight, runtime, head_dim)
+        _check_bias(bias, runtime, out_features)
+        _check_pull_heads(heads, head_dim, runtime, in_features)
+        runtime.check_capacity(batch * sequence, in_features)
         if workspace_epochs <= 0:
             raise ValueError(
                 "workspace_epochs must be positive, "
@@ -1726,7 +1810,8 @@ def prepare_headshard_pull_gemm_sbhd(
     validate_group: bool = True,
 ) -> PreparedHeadShardPullGemmSBHD:
     """Prepare a reusable sequence-first ``all-to-all + linear(weight, bias)``
-    replacement: ``[UP*S,B,H/UP,D]`` to ``[S,B,H,D]``.
+    replacement: ``[UP*S,B,H/UP,D]`` to ``[S,B,N/D,D]`` for an ``[N, K]``
+    weight with ``K = heads * head_dim``.
 
     The returned output aliases a reusable buffer and is overwritten by the
     next call. Call ``clone()`` when the result must outlive a subsequent call.
@@ -1736,22 +1821,11 @@ def prepare_headshard_pull_gemm_sbhd(
     local_error: str | None = None
     try:
         _check_runtime_device(runtime)
-        _check_weight(weight, runtime)
-        _check_bias(bias, runtime)
-        if min(logical_shape) <= 0:
-            raise ValueError(
-                f"all SBHD dimensions must be positive, got {logical_shape}"
-            )
-        if heads % runtime.up:
-            raise ValueError(
-                f"heads={heads} must be divisible by UP={runtime.up}"
-            )
-        if heads * head_dim != runtime.hidden:
-            raise ValueError(
-                f"H*D must equal runtime.hidden={runtime.hidden}, got "
-                f"{heads}*{head_dim}"
-            )
-        runtime.check_rows(sequence * batch)
+        _check_logical_shape(logical_shape)
+        out_features, in_features = _check_pull_weight(weight, runtime, head_dim)
+        _check_bias(bias, runtime, out_features)
+        _check_pull_heads(heads, head_dim, runtime, in_features)
+        runtime.check_capacity(sequence * batch, in_features)
         if workspace_epochs <= 0:
             raise ValueError(
                 f"workspace_epochs must be positive, got {workspace_epochs}"
@@ -1814,8 +1888,9 @@ def prepare_headshard_pull_gemm_thd(
 
     The executable accepts ``[UP*T,H/UP,D]`` inputs in the order produced by
     :func:`peer_write_gemm_thd` with the same ``layout`` (``None`` for the
-    contiguous-slab contract) and returns ``[T,H,D]``. ``tokens`` may be
-    omitted when ``layout`` is given. The output aliases a reusable buffer.
+    contiguous-slab contract) and returns ``[T,N/D,D]`` for an ``[N, K]``
+    weight with ``K = heads * head_dim``. ``tokens`` may be omitted when
+    ``layout`` is given. The output aliases a reusable buffer.
     """
 
     local_error: str | None = None
@@ -1823,8 +1898,9 @@ def prepare_headshard_pull_gemm_thd(
     logical_shape: tuple[int, int, int] | None = None
     try:
         _check_runtime_device(runtime)
-        _check_weight(weight, runtime)
-        _check_bias(bias, runtime)
+        _check_logical_shape((heads, head_dim))
+        out_features, in_features = _check_pull_weight(weight, runtime, head_dim)
+        _check_bias(bias, runtime, out_features)
         if layout is not None:
             _check_layout(layout, runtime)
             if tokens is None:
@@ -1835,21 +1911,10 @@ def prepare_headshard_pull_gemm_thd(
                 )
         if tokens is None:
             raise ValueError("tokens is required when no THD layout is given")
-        runtime.check_rows(tokens)
         logical_shape = (tokens, heads, head_dim)
-        if min(heads, head_dim) <= 0:
-            raise ValueError(
-                f"heads and head_dim must be positive, got {(heads, head_dim)}"
-            )
-        if heads % runtime.up:
-            raise ValueError(
-                f"heads={heads} must be divisible by UP={runtime.up}"
-            )
-        if heads * head_dim != runtime.hidden:
-            raise ValueError(
-                f"H*D must equal runtime.hidden={runtime.hidden}, got "
-                f"{heads}*{head_dim}"
-            )
+        _check_logical_shape(logical_shape)
+        _check_pull_heads(heads, head_dim, runtime, in_features)
+        runtime.check_capacity(tokens, in_features)
         if workspace_epochs <= 0:
             raise ValueError(
                 "workspace_epochs must be positive, "
@@ -1915,12 +1980,15 @@ def headshard_pull_gemm_bshd(
     validate_group: bool = True,
 ) -> Tensor:
     """Pull remote head shards and compute ``linear(x, weight, bias)`` in one
-    kernel."""
+    kernel: ``[B,UP*S,H/UP,D]`` to ``[B,S,N/D,D]`` for an ``[N, H*D]``
+    weight."""
 
     shape: tuple[int, int, int, int] | None = None
     local_error: str | None = None
     try:
-        shape = _pull_shape(head_x, runtime)
+        shape = _pull_shape(
+            head_x, runtime, in_features=_weight_widths(weight)["in_features"]
+        )
     except Exception as error:
         local_error = f"{type(error).__name__}: {error}"
     if validate_group:
@@ -1963,12 +2031,15 @@ def headshard_pull_gemm_sbhd(
     bias: Tensor | None = None,
     validate_group: bool = True,
 ) -> Tensor:
-    """One-shot sequence-first pull-GEMM: ``[UP*S,B,H/UP,D]`` to ``[S,B,H,D]``."""
+    """One-shot sequence-first pull-GEMM: ``[UP*S,B,H/UP,D]`` to
+    ``[S,B,N/D,D]`` for an ``[N, H*D]`` weight."""
 
     shape: tuple[int, int, int, int] | None = None
     local_error: str | None = None
     try:
-        shape = _pull_shape_sbhd(head_x, runtime)
+        shape = _pull_shape_sbhd(
+            head_x, runtime, in_features=_weight_widths(weight)["in_features"]
+        )
     except Exception as error:
         local_error = f"{type(error).__name__}: {error}"
     if validate_group:
@@ -2012,12 +2083,18 @@ def headshard_pull_gemm_thd(
     layout: THDLayout | None = None,
     validate_group: bool = True,
 ) -> Tensor:
-    """One-shot packed-THD pull-GEMM: ``[UP*T,H/UP,D]`` to ``[T,H,D]``."""
+    """One-shot packed-THD pull-GEMM: ``[UP*T,H/UP,D]`` to ``[T,N/D,D]`` for
+    an ``[N, H*D]`` weight."""
 
     shape: tuple[int, int, int] | None = None
     local_error: str | None = None
     try:
-        shape = _pull_shape_thd(head_x, runtime, layout)
+        shape = _pull_shape_thd(
+            head_x,
+            runtime,
+            layout,
+            in_features=_weight_widths(weight)["in_features"],
+        )
     except Exception as error:
         local_error = f"{type(error).__name__}: {error}"
     if validate_group:

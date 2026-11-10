@@ -7,11 +7,11 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
-# Derived from QuACK 0.4.0's SM100 GEMM, which is based on NVIDIA CUTLASS
-# CuTe DSL's SM100 persistent dense GEMM example. Modified to prune unused
-# paths and add CLC scheduling plus a peer-routed epilogue.
+# Derived from QuACK 0.4.0's GEMM, which is based on NVIDIA CUTLASS CuTe
+# DSL's persistent dense GEMM example. Modified to prune unused paths and add
+# dynamic tile scheduling plus a peer-routed epilogue.
 
-"""Standalone BF16 SM100/SM110 CLC-persistent peer-write GEMM."""
+"""Standalone BF16 persistent peer-write GEMM."""
 
 import enum
 import math
@@ -28,7 +28,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.utils.blackwell_helpers as sm100_utils
+import cutlass.utils.blackwell_helpers as gemm_helpers
 import torch
 from cutlass import BFloat16, Boolean, Float32, Int32, Int64, const_expr
 from cutlass._mlir.dialects import llvm, nvvm
@@ -40,7 +40,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import LayoutEnum
 from torch import Tensor
 
-IMPLEMENTATION_REVISION = "peer-write-sm100-v5-128-byte-peer-rows"
+IMPLEMENTATION_REVISION = "peer-write-v5-128-byte-peer-rows"
 
 # Tile configuration of the host APIs: 256x256 MMA tiles on 2-CTA clusters.
 # Output columns are routed to peers per epilogue subtile, so a head shard
@@ -162,7 +162,7 @@ def get_max_active_clusters(
         device_capacity = get_device_capacity()
     if device_capacity[0] not in (10, 11):
         raise ValueError(
-            f"active-cluster query requires SM100/SM110, got {device_capacity}"
+            f"active-cluster query does not support device capability {device_capacity}"
         )
     return cutlass.utils.HardwareInfo(device_id).get_max_active_clusters(
         cluster_size=cluster_size
@@ -1066,7 +1066,7 @@ def setup_epi_tensor(gemm, tensor, epi_tile=None, stage=None):
         epi_tile = gemm.epi_tile
     if stage is None:
         stage = gemm.epi_stage
-    smem_layout_staged = sm100_utils.make_smem_layout_epi(
+    smem_layout_staged = gemm_helpers.make_smem_layout_epi(
         tensor.element_type,
         LayoutEnum.from_tensor(tensor),
         epi_tile,
@@ -1078,7 +1078,7 @@ def setup_epi_tensor(gemm, tensor, epi_tile=None, stage=None):
     return tma_atom, tma_tensor, smem_layout_staged, epi_tile
 
 
-# GEMM base and SM100 implementation.
+# GEMM base and implementation.
 class NamedBarrierGemm(enum.IntEnum):
     # Explicit values preserve the source barrier ABI after pruning.
     Epilogue = 1
@@ -1313,7 +1313,7 @@ class GemmTmaBase(GemmBase):
         )
 
 
-class GemmSm100(GemmTmaBase):
+class PersistentGemm(GemmTmaBase):
     arch = 100
     EpilogueArguments = GemmTmaBase.EpilogueArguments
     EpilogueParams = GemmTmaBase.EpilogueParams
@@ -1394,7 +1394,7 @@ class GemmSm100(GemmTmaBase):
             256 // self.a_dtype.width,
         )
         # CUTLASS DSL 4.4.2 signature: explicit OperandMajorMode A/B args.
-        self.tiled_mma = sm100_utils.make_trivial_tiled_mma(
+        self.tiled_mma = gemm_helpers.make_trivial_tiled_mma(
             self.a_dtype,
             self.a_major_mode,
             self.b_major_mode,
@@ -1425,7 +1425,7 @@ class GemmSm100(GemmTmaBase):
         self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
-        self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
+        self.epi_tile = gemm_helpers.compute_epilogue_tile_shape(
             self.cta_tile_shape_mnk,
             self.use_2cta_instrs,
             self.d_layout if self.d_layout is not None else LayoutEnum.ROW_MAJOR,
@@ -1449,9 +1449,9 @@ class GemmSm100(GemmTmaBase):
                 self.epi_tile[0],
                 cute.coalesce(epi_tile_n_layout),
             )
-        # Each row of a subtile reaches a peer as one NVLink write: 64-byte
-        # rows (32 columns) sustain about 430 GB/s per GPU in the all-to-all,
-        # 128-byte rows (64 columns) about 680 GB/s.
+        # Each row of a subtile reaches a peer as one NVLink write: in the
+        # all-to-all, 128-byte rows (64 columns) sustain about 1.6x the peer
+        # write bandwidth of 64-byte rows (32 columns).
         assert self.cta_tile_shape_mnk[1] % PEER_EPI_TILE_N == 0
         self.epi_tile = (self.epi_tile[0], cute.make_layout(PEER_EPI_TILE_N))
         (
@@ -1475,15 +1475,15 @@ class GemmSm100(GemmTmaBase):
         )
         self.sched_stage = 1
         self.a_prefetch_stage = 0
-        self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
+        self.a_smem_layout_staged = gemm_helpers.make_smem_layout_a(
             self.tiled_mma, self.mma_tiler, self.a_dtype, self.ab_stage
         )
-        self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
+        self.b_smem_layout_staged = gemm_helpers.make_smem_layout_b(
             self.tiled_mma, self.mma_tiler, self.b_dtype, self.ab_stage
         )
         self.epi_smem_layout_staged = None
         if const_expr(self.d_dtype is not None):
-            self.epi_smem_layout_staged = sm100_utils.make_smem_layout_epi(
+            self.epi_smem_layout_staged = gemm_helpers.make_smem_layout_epi(
                 self.d_dtype,
                 self.d_layout,
                 self.epi_tile,
@@ -1530,7 +1530,7 @@ class GemmSm100(GemmTmaBase):
         atom_thr_size = cute.size(self.tiled_mma.thr_id.shape)
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, None, 0))
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, None, 0))
-        a_op = sm100_utils.cluster_shape_to_tma_atom_A(
+        a_op = gemm_helpers.cluster_shape_to_tma_atom_A(
             self.cluster_shape_mnk, self.tiled_mma.thr_id
         )
         tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
@@ -1542,7 +1542,7 @@ class GemmSm100(GemmTmaBase):
             self.cluster_layout_vmnk.shape,
             internal_type=None,
         )
-        b_op = sm100_utils.cluster_shape_to_tma_atom_B(
+        b_op = gemm_helpers.cluster_shape_to_tma_atom_B(
             self.cluster_shape_mnk, self.tiled_mma.thr_id
         )
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
@@ -2073,7 +2073,7 @@ class GemmSm100(GemmTmaBase):
         epi_tile: cute.Tile,
         use_2cta_instrs: Union[Boolean, bool],
     ):
-        copy_atom_t2r = sm100_utils.get_tmem_load_op(
+        copy_atom_t2r = gemm_helpers.get_tmem_load_op(
             self.cta_tile_shape_mnk,
             self.d_layout if self.d_layout is not None else LayoutEnum.ROW_MAJOR,
             self.d_dtype if self.d_dtype is not None else BFloat16,
@@ -2106,7 +2106,7 @@ class GemmSm100(GemmTmaBase):
         sD: Optional[cute.Tensor],
         tidx: Int32,
     ):
-        copy_atom_r2s = sm100_utils.get_smem_store_op(
+        copy_atom_r2s = gemm_helpers.get_smem_store_op(
             d_layout if d_layout is not None else LayoutEnum.ROW_MAJOR,
             dtype if dtype is not None else BFloat16,
             self.acc_dtype,
@@ -2128,7 +2128,7 @@ class GemmSm100(GemmTmaBase):
         producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1)
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, mcast_size)
-        # Built-in no-gather SM100 pipeline.
+        # Built-in no-gather pipeline.
         return pipeline.PipelineTmaUmma.create(
             barrier_storage=ab_pipeline_mbar_ptr,
             num_stages=self.ab_stage,
@@ -2210,14 +2210,14 @@ class GemmSm100(GemmTmaBase):
             warp_shape_mnk,
         )
         epi_c_stage = 0
-        a_smem_layout_one = sm100_utils.make_smem_layout_a(
+        a_smem_layout_one = gemm_helpers.make_smem_layout_a(
             tiled_mma, mma_tiler_mnk, a_dtype, 1
         )
-        b_smem_layout_one = sm100_utils.make_smem_layout_b(
+        b_smem_layout_one = gemm_helpers.make_smem_layout_b(
             tiled_mma, mma_tiler_mnk, b_dtype, 1
         )
         d_smem_layout_one = (
-            sm100_utils.make_smem_layout_epi(d_dtype, d_layout, epi_tile, 1)
+            gemm_helpers.make_smem_layout_epi(d_dtype, d_layout, epi_tile, 1)
             if d_dtype is not None
             else None
         )
@@ -2250,7 +2250,7 @@ class GemmSm100(GemmTmaBase):
 
 
 # Peer-write-specific epilogue hooks. The MRO is intentionally:
-# PeerWriteMixin -> GemmSm100 -> GemmTmaBase -> GemmBase.
+# PeerWriteMixin -> PersistentGemm -> GemmTmaBase -> GemmBase.
 class PeerWriteMixin:
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
@@ -2408,7 +2408,7 @@ class PeerWriteMixin:
         pass
 
     def epi_make_aux_out_copy_atom_r2s(self, params, tiled_copy_t2r):
-        return sm100_utils.get_smem_store_op(
+        return gemm_helpers.get_smem_store_op(
             self.aux_out_layout,
             self.aux_out_dtype,
             self.acc_dtype,
@@ -2539,7 +2539,7 @@ class PeerWriteMixin:
         return tRS_rD
 
 
-class PeerWriteSm100(PeerWriteMixin, GemmSm100):
+class PeerWriteGemm(PeerWriteMixin, PersistentGemm):
     pass
 
 
@@ -2601,7 +2601,7 @@ def _compile_peer_write(
         if has_bias
         else None
     )
-    epi_args = PeerWriteSm100.EpilogueArguments(
+    epi_args = PeerWriteGemm.EpilogueArguments(
         mPeerOut=mPeerOut,
         peer_extras=peer_extras,
         tiles_per_peer=tiles_per_peer,
@@ -2609,7 +2609,7 @@ def _compile_peer_write(
         rounding_mode=rounding_mode,
         mBias=mBias,
     )
-    gemm_obj = PeerWriteSm100(
+    gemm_obj = PeerWriteGemm(
         Float32,
         BFloat16,
         tile_shape_mnk,
@@ -2840,7 +2840,7 @@ def make_peer_write_launch(
 
     device_capacity = get_device_capacity(B.device)
     if device_capacity[0] not in (10, 11):
-        raise ValueError("peer_write only supports SM100/SM110")
+        raise ValueError("peer_write does not support this GPU")
     tile_shape_mnk = (
         (tile_M, tile_N, tile_K) if tile_K is not None else (tile_M, tile_N)
     )
@@ -2905,7 +2905,7 @@ def make_peer_write_launch(
         device_id=device_id,
     )
 
-    epi_args = PeerWriteSm100.EpilogueArguments(
+    epi_args = PeerWriteGemm.EpilogueArguments(
         mPeerOut=PeerOuts_p[0],
         peer_extras=PeerOuts_p[1:],
         tiles_per_peer=None,
